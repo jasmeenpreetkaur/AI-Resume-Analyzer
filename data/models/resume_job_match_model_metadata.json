@@ -1,0 +1,59 @@
+{
+  "step": 10,
+  "model_type": "HistGradientBoostingRegressor",
+  "task": "hybrid_resume_job_relevance_ranking",
+  "input_dataset": "C:\\Users\\jasme\\Desktop\\ai resume analyzer\\data\\processed\\resume_job_matching_dataset.csv",
+  "feature_columns": [
+    "shared_skill_count",
+    "resume_skill_count",
+    "job_skill_count",
+    "jaccard_similarity",
+    "resume_skill_coverage",
+    "job_skill_coverage",
+    "skill_count_difference",
+    "maximum_skill_overlap_ratio",
+    "category_match_signal",
+    "semantic_similarity",
+    "text_containment",
+    "title_similarity",
+    "skill_match_signal"
+  ],
+  "feature_count": 13,
+  "semantic_source": "Step 9 actual resume/job text",
+  "evidence_score": {
+    "used_as_feature": false,
+    "used_as_training_target": false,
+    "reconstructed": false,
+    "modified": false,
+    "audit_only": true
+  },
+  "training_target": "independent multi-signal relevance prior",
+  "pseudo_labels": false,
+  "ground_truth_labels": false,
+  "resume_grouped_split": true,
+  "resume_leakage": false,
+  "validation_size": 0.2,
+  "random_state": 42,
+  "top_k_values": [
+    5,
+    10,
+    20
+  ],
+  "ranking_metrics": {
+    "top_5_prior_overlap": 0.947878787878788,
+    "top_10_prior_overlap": 0.9536437246963563,
+    "top_20_prior_overlap": 0.9631097560975609
+  },
+  "step9_evidence_correlation": 0.9287335949341227,
+  "validation_metrics": {
+    "independent_target_correlation": 0.9994629752649355,
+    "mae": 0.003333033548126823,
+    "rmse": 0.004435181505845096
+  },
+  "feature_importance": {},
+  "warnings": [
+    "Ranking diagnostics are not ground-truth hiring metrics.",
+    "The model has no manually labeled hiring dataset.",
+    "Human validation is required before interpreting scores as hiring relevance."
+  ]
+}

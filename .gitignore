@@ -1,0 +1,158 @@
+# ============================================================
+# AI RESUME ANALYZER - GITIGNORE
+# ============================================================
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ------------------------------------------------------------
+# Environment / Secrets
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# API keys / credentials
+*.key
+*.pem
+secrets/
+credentials/
+credentials.json
+
+# ------------------------------------------------------------
+# Jupyter / Python tools
+# ------------------------------------------------------------
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ------------------------------------------------------------
+# Resume Analyzer generated data
+# ------------------------------------------------------------
+
+# Uploaded/test resumes
+data/test_resume.pdf
+data/test_resumes/
+data/uploads/
+data/user_uploads/
+data/resumes/
+
+# Generated recommendations
+data/recommendations/
+
+# Generated analysis reports
+reports/
+
+# Generated temporary files
+data/tmp/
+data/temp/
+tmp/
+temp/
+
+# ------------------------------------------------------------
+# Model / embedding caches
+# ------------------------------------------------------------
+
+# Sentence Transformer / Hugging Face caches
+.cache/
+cache/
+huggingface/
+.huggingface/
+
+# Local model files
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# Job embedding cache
+data/cache/
+
+# ------------------------------------------------------------
+# Large generated datasets / files
+# ------------------------------------------------------------
+
+# Ignore generated datasets
+data/processed/
+data/generated/
+
+# Keep original job dataset if you want it in Git
+# data/jobs/
+
+# Ignore large CSV/JSON files if generated locally
+# Uncomment these if your generated datasets become large:
+# data/**/*.csv
+# data/**/*.json
+
+# ------------------------------------------------------------
+# Streamlit
+# ------------------------------------------------------------
+.streamlit/secrets.toml
+
+# ------------------------------------------------------------
+# Logs
+# ------------------------------------------------------------
+*.log
+logs/
+
+# ------------------------------------------------------------
+# OS files
+# ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ------------------------------------------------------------
+# IDEs / Editors
+# ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ------------------------------------------------------------
+# Build / packaging
+# ------------------------------------------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ------------------------------------------------------------
+# Coverage
+# ------------------------------------------------------------
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
+# ------------------------------------------------------------
+# Local development files
+# ------------------------------------------------------------
+*.local
+*.bak
+*.tmp
+
+# ------------------------------------------------------------
+# Backup files
+# ------------------------------------------------------------
+*.backup
+*.old
+*.orig

@@ -1,0 +1,88 @@
+AI RESUME ANALYZER
+STEP 11 - HUMAN VALIDATION INSTRUCTIONS
+========================================
+
+PURPOSE
+-------
+This file evaluates whether the Step 10 hybrid matching score
+corresponds to human judgments of resume-job relevance.
+
+IMPORTANT
+---------
+Do NOT try to reproduce the Step 10 score.
+
+Do NOT use Step 9 evidence_score.
+
+Do NOT assume that a high model score means the candidate should
+be hired.
+
+The task is ONLY:
+
+    "How relevant is this resume to this specific job?"
+
+Use the resume and the complete job information provided.
+
+RELEVANCE LABELS
+----------------
+
+0 = NOT RELEVANT
+    The resume is clearly unrelated to the job.
+
+1 = WEAK MATCH
+    Some transferable or overlapping information exists, but the
+    candidate appears poorly aligned with the main requirements.
+
+2 = MODERATE MATCH
+    The resume has meaningful overlap with the job, but important
+    requirements or qualifications are missing.
+
+3 = STRONG MATCH
+    The resume matches most major requirements and responsibilities.
+
+4 = VERY STRONG MATCH
+    The resume shows strong alignment across the major skills,
+    experience, responsibilities and/or qualifications.
+
+IMPORTANT
+---------
+Do not judge personality, appearance, prestige, age, gender,
+ethnicity, religion or other protected/personal characteristics.
+
+Evaluate job-related relevance only.
+
+HUMAN CONFIDENCE
+----------------
+
+1 = Low confidence
+2 = Moderate confidence
+3 = High confidence
+
+HUMAN NOTES
+-----------
+Briefly explain the main reason for your rating.
+
+Example:
+
+"Strong Python and machine-learning experience, but limited
+evidence of production deployment."
+
+SECOND EVALUATOR
+----------------
+If a second evaluator is available, they should independently
+annotate the same samples without seeing evaluator 1's labels.
+
+This allows inter-rater agreement to be calculated.
+
+DO NOT CHANGE
+-------------
+Do not modify:
+- resume_id
+- job_id
+- score_stratum
+- step10_hybrid_match_score
+- resume_text
+- job_title
+- job_description
+- validation_sample_id
+
+Only fill the human annotation columns.

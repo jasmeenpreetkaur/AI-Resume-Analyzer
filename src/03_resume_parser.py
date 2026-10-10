@@ -1,9 +1,20 @@
 """
-AI Resume Analyzer - Step 4
+AI Resume Analyzer - Step 3
 Resume PDF Parser
 
 Pipeline:
-PDF -> Text Extraction -> Text Cleaning -> Section Detection -> JSONL
+PDF -> Text Extraction (+ OCR for scanned pages) -> Text Cleaning
+    -> Section Detection -> JSONL
+
+Text extraction is the shared ``pdf_text`` module, the same code the
+Streamlit app and Step 13 use. Pages with no usable text layer
+(scanned / image-only resumes) are read with OCR when an OCR engine is
+installed; every record says whether OCR was used and how reliable the
+text is.
+
+The JSONL written here is consumed by Step 4
+(04_prepare_text_data.py), which uses it as the resume text for the rest
+of the offline pipeline.
 
 No ML, embeddings, LLM, ESCO matching, or ATS scoring is performed here.
 """
@@ -19,10 +30,15 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 try:
-    import fitz  # PyMuPDF
-except ImportError:
-    print("PyMuPDF is not installed.")
-    print("Install it using: pip install pymupdf")
+    from pdf_text import (
+        PDFExtraction,
+        clean_text,
+        extract_pdf_text as extract_pdf,
+        ocr_engine_status,
+    )
+except ImportError as exc:
+    print(f"Could not import the shared PDF module: {exc}")
+    print("Install PyMuPDF using: pip install pymupdf")
     sys.exit(1)
 
 
@@ -239,87 +255,9 @@ def get_category(pdf_path: Path, root: Path) -> Optional[str]:
 # ============================================================
 # PDF TEXT EXTRACTION
 # ============================================================
-
-def extract_pdf_text(pdf_path: Path) -> Tuple[str, int]:
-    """
-    Extract text from a PDF using PyMuPDF.
-
-    Returns:
-        text, page_count
-    """
-
-    document = fitz.open(pdf_path)
-
-    try:
-        page_count = len(document)
-
-        page_text = []
-
-        for page in document:
-            text = page.get_text("text")
-
-            if text:
-                page_text.append(text)
-
-        raw_text = "\n".join(page_text)
-
-    finally:
-        document.close()
-
-    return raw_text, page_count
-
-
-# ============================================================
-# TEXT CLEANING
-# ============================================================
-
-def clean_text(text: str) -> str:
-    """
-    Clean PDF-extracted text while preserving useful structure.
-    """
-
-    if not text:
-        return ""
-
-    # Normalize line endings.
-    text = text.replace("\r\n", "\n")
-    text = text.replace("\r", "\n")
-
-    # Normalize non-breaking spaces.
-    text = text.replace("\xa0", " ")
-
-    # Remove trailing whitespace.
-    lines = [
-        line.strip()
-        for line in text.split("\n")
-    ]
-
-    # Remove excessive blank lines.
-    cleaned_lines = []
-
-    previous_blank = False
-
-    for line in lines:
-
-        if not line:
-            if not previous_blank:
-                cleaned_lines.append("")
-
-            previous_blank = True
-            continue
-
-        cleaned_lines.append(line)
-        previous_blank = False
-
-    text = "\n".join(cleaned_lines)
-
-    # Normalize excessive spaces inside a line.
-    text = re.sub(r"[ \t]+", " ", text)
-
-    # Keep a maximum of two consecutive newlines.
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
+#
+# Extraction and cleaning live in pdf_text.py (shared with the app and
+# Step 13), including the OCR fallback for scanned pages.
 
 
 # ============================================================
@@ -416,6 +354,51 @@ def extract_sections(text: str) -> Dict[str, str]:
 # RESUME RECORD
 # ============================================================
 
+def _display_path(pdf_path: Path) -> str:
+
+    try:
+        return str(pdf_path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(pdf_path)
+
+
+def _failed_record(
+    pdf_path: Path,
+    category: Optional[str],
+    reason: str,
+    *,
+    pdf_status: str = "failed",
+    page_count: int = 0,
+    detail: Optional[Dict] = None
+) -> Dict:
+
+    record = {
+        "resume_id": pdf_path.stem,
+        "pdf_path": _display_path(pdf_path),
+        "category": category,
+        "extraction_status": "failed",
+        "pdf_status": pdf_status,
+        "failure_reason": reason,
+        "page_count": page_count,
+        "raw_text": "",
+        "sections": {},
+        "character_count": 0,
+        "word_count": 0,
+        "extraction_quality": "empty",
+        "ocr_used": False,
+        "ocr_engine": None,
+        "ocr_pages": 0,
+        "pages_needing_ocr": 0,
+        "mean_ocr_confidence": None,
+        "extraction_warnings": []
+    }
+
+    if detail:
+        record.update(detail)
+
+    return record
+
+
 def build_resume_record(
     pdf_path: Path,
     root: Path
@@ -425,52 +408,42 @@ def build_resume_record(
 
     try:
 
-        raw_text, page_count = extract_pdf_text(pdf_path)
-
-        cleaned = clean_text(raw_text)
-
-        if not cleaned:
-            return {
-                "resume_id": pdf_path.stem,
-                "pdf_path": str(pdf_path.relative_to(PROJECT_ROOT)),
-                "category": category,
-                "extraction_status": "failed",
-                "failure_reason": "No extractable text",
-                "page_count": page_count,
-                "raw_text": "",
-                "sections": {},
-                "character_count": 0,
-                "word_count": 0
-            }
-
-        sections = extract_sections(cleaned)
-
-        return {
-            "resume_id": pdf_path.stem,
-            "pdf_path": str(pdf_path.relative_to(PROJECT_ROOT)),
-            "category": category,
-            "extraction_status": "success",
-            "page_count": page_count,
-            "raw_text": cleaned,
-            "sections": sections,
-            "character_count": len(cleaned),
-            "word_count": len(cleaned.split())
-        }
+        extraction = extract_pdf(pdf_path)
 
     except Exception as exc:
 
-        return {
-            "resume_id": pdf_path.stem,
-            "pdf_path": str(pdf_path.relative_to(PROJECT_ROOT)),
-            "category": category,
-            "extraction_status": "failed",
-            "failure_reason": str(exc),
-            "page_count": 0,
-            "raw_text": "",
-            "sections": {},
-            "character_count": 0,
-            "word_count": 0
-        }
+        return _failed_record(pdf_path, category, str(exc))
+
+    if not extraction.usable:
+
+        # Includes scanned PDFs when no OCR engine is installed: the
+        # reason says so instead of a generic "no extractable text".
+        return _failed_record(
+            pdf_path,
+            category,
+            extraction.user_message() or "No extractable text",
+            pdf_status=extraction.status,
+            page_count=extraction.page_count,
+            detail=extraction.to_record()
+        )
+
+    cleaned = extraction.text
+
+    sections = extract_sections(cleaned)
+
+    return {
+        "resume_id": pdf_path.stem,
+        "pdf_path": _display_path(pdf_path),
+        "category": category,
+        "extraction_status": "success",
+        "pdf_status": extraction.status,
+        "page_count": extraction.page_count,
+        "raw_text": cleaned,
+        "sections": sections,
+        "character_count": len(cleaned),
+        "word_count": len(cleaned.split()),
+        **extraction.to_record()
+    }
 
 
 # ============================================================
@@ -519,6 +492,12 @@ def create_report(
         for section in record.get("sections", {}):
             section_counts[section] += 1
 
+    ocr_records = [
+        record
+        for record in records
+        if record.get("ocr_used")
+    ]
+
     return {
         "total_pdfs_discovered": len(pdf_files),
 
@@ -547,6 +526,34 @@ def create_report(
             if successful
             else 0
         ),
+
+        "pdf_status_counts": dict(
+            sorted(
+                Counter(
+                    record.get("pdf_status", "unknown")
+                    for record in records
+                ).items()
+            )
+        ),
+
+        "ocr": {
+            "engine_status": ocr_engine_status(),
+            "pdfs_read_with_ocr": len(ocr_records),
+            "ocr_pages": sum(
+                record.get("ocr_pages", 0)
+                for record in ocr_records
+            ),
+            "low_quality_extractions": sum(
+                1
+                for record in records
+                if record.get("extraction_quality") == "low"
+            ),
+            "scanned_pdfs_without_ocr_engine": sum(
+                1
+                for record in records
+                if record.get("pdf_status") == "ocr_unavailable"
+            )
+        },
 
         "category_distribution": dict(
             sorted(category_counts.items())
@@ -642,7 +649,7 @@ def validate_results(
 def main() -> None:
 
     print("=" * 70)
-    print("AI RESUME ANALYZER - STEP 4 RESUME PARSING")
+    print("AI RESUME ANALYZER - STEP 3 RESUME PARSING")
     print("=" * 70)
 
     logger.info(
@@ -654,6 +661,20 @@ def main() -> None:
         "Resume dataset directory: %s",
         RESUME_DATASET_DIR
     )
+
+    ocr_status = ocr_engine_status()
+
+    if ocr_status["selected"]:
+        logger.info(
+            "OCR engine for scanned pages: %s",
+            ocr_status["selected"]
+        )
+    else:
+        logger.warning(
+            "No OCR engine available: scanned / image-only PDFs will be "
+            "reported as failed. %s",
+            ocr_status["hint"]
+        )
 
     if not RESUME_DATASET_DIR.exists():
         raise FileNotFoundError(
@@ -775,7 +796,7 @@ def main() -> None:
 
     print()
     print("=" * 70)
-    print("STEP 4 COMPLETE")
+    print("STEP 3 COMPLETE")
     print("=" * 70)
 
     print(f"Total PDFs:       {report['total_pdfs_discovered']}")
@@ -799,6 +820,21 @@ def main() -> None:
     print(
         f"Average words:    "
         f"{report['average_words_per_successful_resume']}"
+    )
+
+    print(
+        f"Read with OCR:    "
+        f"{report['ocr']['pdfs_read_with_ocr']}"
+    )
+
+    print(
+        f"Low quality text: "
+        f"{report['ocr']['low_quality_extractions']}"
+    )
+
+    print(
+        f"Scanned, no OCR:  "
+        f"{report['ocr']['scanned_pdfs_without_ocr_engine']}"
     )
 
     print()

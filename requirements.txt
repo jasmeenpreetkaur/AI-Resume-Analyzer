@@ -1,0 +1,34 @@
+# Core pipeline
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3          # HistGradientBoostingRegressor (Step 10b)
+joblib>=1.3
+python-dotenv>=1.0
+
+# PDF text extraction (digital PDFs) + page rendering for OCR
+pymupdf>=1.24
+
+# Semantic embeddings
+sentence-transformers>=2.7
+
+# Web app
+streamlit>=1.35
+
+# Optional: LLM explanations (the app falls back to deterministic text)
+groq>=0.9
+
+# Optional: OCR for scanned / image-only resumes. Install ONE engine.
+# The app and Steps 3/13 pick the first available, in this order:
+#   1. Tesseract   pip install pytesseract pillow   (+ the Tesseract program:
+#                  apt install tesseract-ocr  /  brew install tesseract  /
+#                  https://github.com/UB-Mannheim/tesseract/wiki on Windows)
+#   2. PyMuPDF OCR (needs the Tesseract program and its language data)
+#   3. RapidOCR    pip install rapidocr-onnxruntime pillow   (pure pip, no
+#                  separate program; a good choice on Windows)
+# Force one with RESUME_OCR_ENGINE=tesseract|pymupdf|rapidocr|none
+pytesseract>=0.3.10
+pillow>=10.0
+# rapidocr-onnxruntime>=1.3
+
+# Tests
+pytest>=8.0

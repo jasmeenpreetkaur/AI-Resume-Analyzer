@@ -5,45 +5,47 @@ AI RESUME ANALYZER - STREAMLIT APPLICATION
 
 USER FLOW
 ---------
-Upload Resume
-    ↓
-Extract Resume Text
-    ↓
-Load External Skill Vocabulary
-    ↓
-Extract Resume Skills
-    ↓
-Generate Resume Semantic Embedding
-    ↓
-Load Cached Job Embeddings
-    ↓
-Load / Build Cached Job Skill Evidence
-    ↓
-Calculate Semantic Similarity
-    ↓
-Calculate Skill Matches / Gaps
-    ↓
-Hybrid Ranking
-    ↓
-Top-K Jobs
-    ↓
-Groq Explanation for Top-K only
-    ↓
-User-Friendly Resume Analysis
+Upload Resume (text-based OR scanned PDF)
+    -> Extract text (pdf_text.py; OCR fallback for image-only pages)
+    -> Extract skills (esco_vocab.py; ESCO skills table only)
+    -> Resume semantic embedding
+    -> Job embeddings + job skill sets (job_ranker.py; fingerprinted
+       caches, rebuilt automatically when the data or model changes)
+    -> Score every job (matching_core.MatchScorer)
+    -> Top-K jobs
+    -> Groq explanation for Top-K only (explanation only)
+    -> User-friendly resume analysis
+
+ONE SCORING DEFINITION
+----------------------
+Scores come from matching_core.MatchScorer - the same object Step 10
+(offline ranking) and Step 13 (command line) use:
+
+  * models/match_regressor.joblib present and valid (Step 10b)
+        -> the trained HistGradientBoostingRegressor scores every job;
+  * otherwise -> the transparent weighted formula (weights defined once
+    in matching_core.WEIGHTS).
+
+The sidebar and the results page always say which one ran.
+
+SKILLS
+------
+Only the ESCO skills table counts (preferredLabel + altLabels of
+KnowledgeSkillCompetence rows). Occupations, skill groups and other
+files in data/external are never read as skills.
 
 IMPORTANT
 ---------
-This application does NOT require:
-    resume_analyzer_backend.py
+This application does NOT require resume_analyzer_backend.py.
 
-It directly uses:
+It uses:
     data/jobs/all_job_post.csv
-    data/cache/job_embeddings.npy
-    data/external/*
+    data/processed/esco_skills_clean.csv   or   data/external/skills_en.csv
+    models/match_regressor.joblib          (optional)
 
 Caches:
-    data/cache/job_embeddings.npy
-    data/cache/job_skill_evidence.json
+    data/cache/job_embeddings.npy (+ .meta.json)
+    data/cache/job_skill_index.json
 
 Run:
     python -m streamlit run src/14_app.py
@@ -53,8 +55,7 @@ Run:
 from __future__ import annotations
 
 import os
-import re
-import json
+import html
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -63,14 +64,18 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-try:
-    import pymupdf
-except ImportError:
-    import fitz as pymupdf
-
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+
+import matching_core as mc
+import pdf_text
+from esco_vocab import load_esco_vocabulary
+from job_ranker import (
+    build_job_corpus,
+    rank_jobs,
+    resume_skill_uris,
+    skill_breakdown,
+)
 
 
 # ======================================================================
@@ -86,11 +91,6 @@ JOB_DATA_PATH = DATA_DIR / "jobs" / "all_job_post.csv"
 CACHE_DIR = DATA_DIR / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-JOB_EMBEDDING_CACHE = CACHE_DIR / "job_embeddings.npy"
-JOB_SKILL_CACHE = CACHE_DIR / "job_skill_evidence.json"
-
-EXTERNAL_DIR = DATA_DIR / "external"
-
 ENV_PATH = PROJECT_ROOT / ".env"
 
 load_dotenv(ENV_PATH)
@@ -100,7 +100,7 @@ load_dotenv(ENV_PATH)
 # CONFIGURATION
 # ======================================================================
 
-MODEL_NAME = "all-MiniLM-L6-v2"
+MODEL_NAME = mc.SEMANTIC_MODEL_NAME
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
@@ -209,33 +209,6 @@ def clean_text(value: Any) -> str:
     return str(value).strip()
 
 
-def normalize_text(text: str) -> str:
-    """
-    Normalize text for skill matching.
-    """
-    text = clean_text(text).lower()
-
-    text = text.replace("–", "-")
-    text = text.replace("—", "-")
-    text = text.replace("&", " and ")
-
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def normalize_skill(skill: str) -> str:
-    skill = normalize_text(skill)
-
-    skill = skill.replace("node js", "node.js")
-    skill = skill.replace("scikit learn", "scikit-learn")
-    skill = skill.replace("machine-learning", "machine learning")
-    skill = skill.replace("deep-learning", "deep learning")
-    skill = skill.replace("natural-language-processing", "natural language processing")
-
-    return skill.strip()
-
-
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -248,35 +221,21 @@ def score_percent(value: float) -> str:
     return f"{value * 100:.1f}%"
 
 
+class ResumeReadError(ValueError):
+    """The uploaded PDF could not be turned into usable text."""
+
+
 # ======================================================================
-# PDF EXTRACTION
+# PDF EXTRACTION (shared with Step 3 / Step 13; OCR for scanned pages)
 # ======================================================================
 
 @st.cache_data(show_spinner=False)
-def extract_pdf_text(file_bytes: bytes) -> str:
-
-    document = pymupdf.open(
-        stream=file_bytes,
-        filetype="pdf"
-    )
-
-    pages = []
-
-    for page in document:
-        text = page.get_text("text")
-
-        if text:
-            pages.append(text)
-
-    document.close()
-
-    text = "\n".join(pages)
-
-    return text.strip()
+def extract_resume(file_bytes: bytes) -> pdf_text.PDFExtraction:
+    return pdf_text.extract_pdf_text(file_bytes)
 
 
 # ======================================================================
-# JOB DATASET
+# CACHED RESOURCES
 # ======================================================================
 
 @st.cache_data(show_spinner=False)
@@ -297,128 +256,6 @@ def load_jobs() -> pd.DataFrame:
     return df
 
 
-# ======================================================================
-# COLUMN DETECTION
-# ======================================================================
-
-def find_column(
-    df: pd.DataFrame,
-    candidates: list[str],
-    required: bool = False
-) -> str | None:
-
-    normalized = {
-        str(col).strip().lower(): col
-        for col in df.columns
-    }
-
-    for candidate in candidates:
-
-        candidate = candidate.lower()
-
-        if candidate in normalized:
-            return normalized[candidate]
-
-    for col in df.columns:
-
-        col_lower = str(col).lower()
-
-        for candidate in candidates:
-
-            if candidate.lower() in col_lower:
-                return col
-
-    if required:
-        raise ValueError(
-            f"Could not find required column.\n"
-            f"Available columns: {list(df.columns)}"
-        )
-
-    return None
-
-
-def identify_job_columns(df: pd.DataFrame):
-
-    title_col = find_column(
-        df,
-        [
-            "job_title",
-            "title",
-            "jobtitle",
-            "position",
-            "job"
-        ],
-        required=True
-    )
-
-    description_col = find_column(
-        df,
-        [
-            "job_description",
-            "description",
-            "jobdescription",
-            "details",
-            "text"
-        ],
-        required=True
-    )
-
-    company_col = find_column(
-        df,
-        [
-            "company",
-            "company_name",
-            "employer"
-        ]
-    )
-
-    location_col = find_column(
-        df,
-        [
-            "location",
-            "job_location",
-            "city"
-        ]
-    )
-
-    id_col = find_column(
-        df,
-        [
-            "job_id",
-            "id",
-            "jobid"
-        ]
-    )
-
-    return (
-        id_col,
-        title_col,
-        description_col,
-        company_col,
-        location_col
-    )
-
-
-# ======================================================================
-# JOB TEXT
-# ======================================================================
-
-def build_job_text(
-    row: pd.Series,
-    title_col: str,
-    description_col: str
-) -> str:
-
-    title = clean_text(row[title_col])
-    description = clean_text(row[description_col])
-
-    return f"{title}. {description}".strip()
-
-
-# ======================================================================
-# SEMANTIC MODEL
-# ======================================================================
-
 @st.cache_resource(show_spinner=False)
 def load_semantic_model():
 
@@ -427,611 +264,108 @@ def load_semantic_model():
     )
 
 
-# ======================================================================
-# JOB EMBEDDINGS
-# ======================================================================
-
-def create_job_embeddings(
-    jobs: pd.DataFrame,
-    title_col: str,
-    description_col: str,
-    model: SentenceTransformer
-):
-
-    texts = [
-        build_job_text(
-            row,
-            title_col,
-            description_col
-        )
-        for _, row in jobs.iterrows()
-    ]
-
-    embeddings = model.encode(
-        texts,
-        batch_size=32,
-        show_progress_bar=False,
-        normalize_embeddings=True,
-        convert_to_numpy=True
-    )
-
-    return embeddings.astype(
-        np.float32
-    )
-
-
-def load_job_embeddings(
-    jobs: pd.DataFrame,
-    title_col: str,
-    description_col: str,
-    model: SentenceTransformer
-):
-
-    if JOB_EMBEDDING_CACHE.exists():
-
-        try:
-
-            embeddings = np.load(
-                JOB_EMBEDDING_CACHE
-            )
-
-            if (
-                embeddings.shape[0] == len(jobs)
-                and embeddings.shape[1] == 384
-            ):
-                return embeddings
-
-        except Exception:
-            pass
-
-    embeddings = create_job_embeddings(
-        jobs,
-        title_col,
-        description_col,
-        model
-    )
-
-    np.save(
-        JOB_EMBEDDING_CACHE,
-        embeddings
-    )
-
-    return embeddings
-
-
-# ======================================================================
-# EXTERNAL SKILL VOCABULARY
-# ======================================================================
-
-def locate_external_csvs() -> list[Path]:
-
-    if not EXTERNAL_DIR.exists():
-        return []
-
-    return list(
-        EXTERNAL_DIR.rglob("*.csv")
-    )
-
-
-def find_skill_columns(
-    df: pd.DataFrame
-) -> list[str]:
-
-    candidates = [
-        "preferredLabel",
-        "preferred_label",
-        "skill",
-        "skill_name",
-        "skillName",
-        "name",
-        "label",
-        "title",
-        "conceptUri",
-    ]
-
-    result = []
-
-    for col in df.columns:
-
-        col_lower = str(col).lower()
-
-        for candidate in candidates:
-
-            if candidate.lower() == col_lower:
-                result.append(col)
-                break
-
-    return result
-
-
-@st.cache_data(show_spinner=False)
-def load_external_skill_vocabulary():
-
-    csv_files = locate_external_csvs()
-
-    if not csv_files:
-        return []
-
-    skills = set()
-
-    for csv_file in csv_files:
-
-        try:
-
-            df = pd.read_csv(
-                csv_file,
-                low_memory=False
-            )
-
-        except Exception:
-            continue
-
-        columns = find_skill_columns(
-            df
-        )
-
-        for col in columns:
-
-            for value in df[col].tolist():
-
-                value = clean_text(value)
-
-                if not value:
-                    continue
-
-                normalized = normalize_skill(
-                    value
-                )
-
-                # Avoid useless one-character entries
-                # except known programming language C.
-                if len(normalized) == 1:
-                    if normalized != "c":
-                        continue
-
-                if len(normalized) < 2:
-                    continue
-
-                skills.add(
-                    normalized
-                )
-
-    return sorted(
-        skills,
-        key=lambda x: (-len(x), x)
-    )
-
-
-# ======================================================================
-# SKILL MATCHING
-# ======================================================================
-
-def create_skill_pattern(
-    skills: list[str]
-):
-
-    usable = []
-
-    for skill in skills:
-
-        escaped = re.escape(
-            normalize_skill(skill)
-        )
-
-        usable.append(
-            escaped
-        )
-
-    if not usable:
-        return None
-
-    # Longest first prevents short skills from stealing matches
-    usable.sort(
-        key=len,
-        reverse=True
-    )
-
-    pattern = (
-        r"(?<!\w)(?:"
-        + "|".join(usable)
-        + r")(?!\w)"
-    )
+@st.cache_resource(show_spinner=False)
+def load_vocabulary(signature: str):
+    """
+    ESCO skills vocabulary (skills table only). Returns
+    ``(vocabulary_or_None, error_message)``.
+    ``signature`` changes when the skills file changes.
+    """
 
     try:
-        return re.compile(
-            pattern,
-            re.IGNORECASE
-        )
-    except re.error:
-        return None
+        return load_esco_vocabulary(), ""
+
+    except (FileNotFoundError, ValueError) as exc:
+        return None, str(exc)
+
+
+def vocabulary_signature() -> str:
+
+    from esco_vocab import find_esco_skills_file
+
+    path = find_esco_skills_file()
+
+    if path is None:
+        return "missing"
+
+    stat = path.stat()
+
+    return f"{path}:{stat.st_size}:{stat.st_mtime_ns}"
 
 
 @st.cache_resource(show_spinner=False)
-def get_skill_pattern(
-    vocabulary_tuple: tuple[str, ...]
-):
-
-    return create_skill_pattern(
-        list(vocabulary_tuple)
-    )
-
-
-def extract_resume_skills(
-    resume_text: str,
-    vocabulary: list[str]
-):
-
-    if not resume_text or not vocabulary:
-        return []
-
-    pattern = get_skill_pattern(
-        tuple(vocabulary)
-    )
-
-    if pattern is None:
-        return []
-
-    normalized_resume = normalize_text(
-        resume_text
-    )
-
-    found = set()
-
-    for match in pattern.finditer(
-        normalized_resume
-    ):
-
-        skill = normalize_skill(
-            match.group(0)
-        )
-
-        found.add(
-            skill
-        )
-
-    return sorted(
-        found
-    )
-
-
-# ======================================================================
-# JOB SKILL EVIDENCE
-# ======================================================================
-
-def build_job_skill_evidence_once(
-    jobs: pd.DataFrame,
-    title_col: str,
-    description_col: str,
-    vocabulary: list[str]
-):
-
+def load_scorer(signature: str) -> mc.MatchScorer:
     """
-    IMPORTANT:
-    This function is called ONLY when the cache does not exist.
-
-    It creates skill evidence for all jobs in one preprocessing pass.
+    The shared scorer: trained model if one is installed, otherwise the
+    transparent formula. ``signature`` changes when the model file does.
     """
 
-    pattern = create_skill_pattern(
-        vocabulary
+    return mc.MatchScorer.load()
+
+
+def scorer_signature() -> str:
+
+    import os as _os
+
+    path = Path(
+        _os.getenv("MATCH_MODEL_PATH") or mc.DEFAULT_MODEL_PATH
     )
 
-    evidence = {}
+    if not path.is_file():
+        return f"none:{path}"
 
-    if pattern is None:
-        return evidence
+    stat = path.stat()
 
-    for index, row in jobs.iterrows():
-
-        job_text = normalize_text(
-            build_job_text(
-                row,
-                title_col,
-                description_col
-            )
-        )
-
-        matched = set()
-
-        for match in pattern.finditer(
-            job_text
-        ):
-
-            skill = normalize_skill(
-                match.group(0)
-            )
-
-            matched.add(
-                skill
-            )
-
-        evidence[str(index)] = sorted(
-            matched
-        )
-
-    return evidence
+    return f"{path}:{stat.st_size}:{stat.st_mtime_ns}"
 
 
-def load_or_build_job_skill_evidence(
-    jobs: pd.DataFrame,
-    title_col: str,
-    description_col: str,
-    vocabulary: list[str]
+@st.cache_resource(
+    show_spinner="Preparing job embeddings and skills "
+    "(first run only - this can take a few minutes)..."
+)
+def load_corpus(
+    jobs_signature: str,
+    vocabulary_sig: str,
+    _jobs: pd.DataFrame,
+    _vocabulary,
+    _model,
 ):
+    """
+    Job embeddings, job skill sets and lexical indexes. The caches on
+    disk are fingerprinted by job text, embedding model and vocabulary,
+    so they are rebuilt whenever any of them change - never reused stale.
+    """
 
-    # --------------------------------------------------------------
-    # FAST PATH
-    # --------------------------------------------------------------
+    def encode(texts):
 
-    if JOB_SKILL_CACHE.exists():
-
-        try:
-
-            with open(
-                JOB_SKILL_CACHE,
-                "r",
-                encoding="utf-8"
-            ) as f:
-
-                cached = json.load(f)
-
-            if (
-                cached.get("job_count")
-                == len(jobs)
-                and cached.get("skill_count")
-                == len(vocabulary)
-            ):
-
-                return cached["evidence"]
-
-        except Exception:
-            pass
-
-    # --------------------------------------------------------------
-    # FIRST-TIME BUILD
-    # --------------------------------------------------------------
-
-    progress = st.progress(
-        0
-    )
-
-    status = st.empty()
-
-    status.info(
-        "Preparing job skill evidence for the first run..."
-    )
-
-    evidence = {}
-
-    pattern = create_skill_pattern(
-        vocabulary
-    )
-
-    total = len(jobs)
-
-    if pattern is None:
-
-        return {}
-
-    for position, (_, row) in enumerate(
-        jobs.iterrows()
-    ):
-
-        job_text = normalize_text(
-            build_job_text(
-                row,
-                title_col,
-                description_col
-            )
+        return np.asarray(
+            _model.encode(
+                list(texts),
+                batch_size=32,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            ),
+            dtype=np.float32
         )
 
-        matched = set()
-
-        for match in pattern.finditer(
-            job_text
-        ):
-
-            matched.add(
-                normalize_skill(
-                    match.group(0)
-                )
-            )
-
-        evidence[str(position)] = sorted(
-            matched
-        )
-
-        if position % 25 == 0:
-
-            progress.progress(
-                min(
-                    1.0,
-                    (position + 1) / total
-                )
-            )
-
-    progress.progress(
-        1.0
-    )
-
-    # --------------------------------------------------------------
-    # SAVE CACHE
-    # --------------------------------------------------------------
-
-    payload = {
-        "job_count": len(jobs),
-        "skill_count": len(vocabulary),
-        "evidence": evidence
-    }
-
-    with open(
-        JOB_SKILL_CACHE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            payload,
-            f,
-            ensure_ascii=False
-        )
-
-    status.success(
-        "Job skill evidence cached successfully."
-    )
-
-    return evidence
-
-
-# ======================================================================
-# RESUME EMBEDDING
-# ======================================================================
-
-def generate_resume_embedding(
-    resume_text: str,
-    model: SentenceTransformer
-):
-
-    embedding = model.encode(
-        [resume_text],
-        normalize_embeddings=True,
-        convert_to_numpy=True
-    )
-
-    return embedding.astype(
-        np.float32
+    return build_job_corpus(
+        _jobs,
+        encode=encode,
+        model_name=MODEL_NAME,
+        vocabulary=_vocabulary,
+        cache_dir=CACHE_DIR,
     )
 
 
-# ======================================================================
-# SKILL MATCH SIGNAL
-# ======================================================================
+def jobs_signature() -> str:
 
-def calculate_skill_signal(
-    resume_skills: set[str],
-    job_skills: set[str]
-):
+    if not JOB_DATA_PATH.exists():
+        return "missing"
 
-    if not job_skills:
-        return 0.0
+    stat = JOB_DATA_PATH.stat()
 
-    matched = resume_skills.intersection(
-        job_skills
-    )
-
-    return len(matched) / len(
-        job_skills
-    )
-
-
-def calculate_skill_gap(
-    resume_skills: set[str],
-    job_skills: set[str]
-):
-
-    return sorted(
-        job_skills - resume_skills
-    )
-
-
-def calculate_skill_matches(
-    resume_skills: set[str],
-    job_skills: set[str]
-):
-
-    return sorted(
-        resume_skills.intersection(
-            job_skills
-        )
-    )
-
-
-# ======================================================================
-# HYBRID RANKING
-# ======================================================================
-
-def calculate_rankings(
-    jobs: pd.DataFrame,
-    job_embeddings: np.ndarray,
-    resume_embedding: np.ndarray,
-    job_skill_evidence: dict,
-    resume_skills: list[str],
-    title_col: str
-):
-
-    resume_skill_set = {
-        normalize_skill(x)
-        for x in resume_skills
-    }
-
-    semantic_scores = cosine_similarity(
-        resume_embedding,
-        job_embeddings
-    )[0]
-
-    results = []
-
-    for index, row in jobs.iterrows():
-
-        job_skills = set(
-            job_skill_evidence.get(
-                str(index),
-                []
-            )
-        )
-
-        matched = calculate_skill_matches(
-            resume_skill_set,
-            job_skills
-        )
-
-        gaps = calculate_skill_gap(
-            resume_skill_set,
-            job_skills
-        )
-
-        skill_signal = calculate_skill_signal(
-            resume_skill_set,
-            job_skills
-        )
-
-        semantic = safe_float(
-            semantic_scores[index]
-        )
-
-        # Keep semantic similarity as the main signal.
-        # Skill evidence provides an additional interpretable signal.
-        hybrid = (
-            0.75 * semantic
-            + 0.25 * skill_signal
-        )
-
-        results.append(
-            {
-                "row_index": int(index),
-                "job_title": clean_text(
-                    row[title_col]
-                ),
-                "semantic_similarity": semantic,
-                "skill_match_signal": skill_signal,
-                "hybrid_match_score": hybrid,
-                "matched_skills": matched,
-                "skill_gaps": gaps,
-            }
-        )
-
-    result_df = pd.DataFrame(
-        results
-    )
-
-    result_df = result_df.sort_values(
-        "hybrid_match_score",
-        ascending=False
-    ).reset_index(
-        drop=True
-    )
-
-    return result_df
+    return f"{JOB_DATA_PATH}:{stat.st_size}:{stat.st_mtime_ns}"
 
 
 # ======================================================================
@@ -1252,13 +586,15 @@ def render_skills(
 
     css_class = "gap" if gap else "skill"
 
-    html = "".join(
-        f'<span class="{css_class}">{skill}</span>'
+    # Labels come from data files and a PDF; escape before putting them
+    # into raw HTML.
+    markup = "".join(
+        f'<span class="{css_class}">{html.escape(str(skill))}</span>'
         for skill in skills[:20]
     )
 
     st.markdown(
-        html,
+        markup,
         unsafe_allow_html=True
     )
 
@@ -1273,21 +609,37 @@ def analyze_resume(
 ):
 
     # --------------------------------------------------------------
-    # 1. TEXT
+    # 1. TEXT (OCR fallback for scanned / image-only PDFs)
     # --------------------------------------------------------------
 
     st.write(
         "📄 Extracting resume text..."
     )
 
-    resume_text = extract_pdf_text(
+    extraction = extract_resume(
         resume_bytes
     )
 
-    if not resume_text:
+    if not extraction.usable:
 
-        raise ValueError(
-            "Could not extract text from this PDF."
+        raise ResumeReadError(
+            extraction.user_message()
+        )
+
+    resume_text = extraction.text
+
+    if extraction.ocr_used:
+
+        st.info(
+            f"Scanned page(s) {extraction.ocr_pages} were read with OCR "
+            f"({extraction.ocr_engine}). OCR can make mistakes, so check "
+            "the detected skills below."
+        )
+
+    for warning in extraction.warnings:
+
+        st.warning(
+            warning
         )
 
     st.success(
@@ -1304,22 +656,12 @@ def analyze_resume(
 
     jobs = load_jobs()
 
-    (
-        id_col,
-        title_col,
-        description_col,
-        company_col,
-        location_col
-    ) = identify_job_columns(
-        jobs
-    )
-
     st.success(
         f"Loaded {len(jobs):,} job postings"
     )
 
     # --------------------------------------------------------------
-    # 3. MODEL
+    # 3. MODEL, SKILLS VOCABULARY, SCORER
     # --------------------------------------------------------------
 
     st.write(
@@ -1328,58 +670,73 @@ def analyze_resume(
 
     model = load_semantic_model()
 
-    # --------------------------------------------------------------
-    # 4. JOB EMBEDDINGS
-    # --------------------------------------------------------------
-
     st.write(
-        "⚡ Loading cached job embeddings..."
+        "📚 Loading ESCO skill vocabulary..."
     )
 
-    job_embeddings = load_job_embeddings(
-        jobs,
-        title_col,
-        description_col,
-        model
+    vocabulary, vocabulary_error = load_vocabulary(
+        vocabulary_signature()
     )
 
-    st.success(
-        f"Job embedding matrix: {job_embeddings.shape}"
-    )
-
-    # --------------------------------------------------------------
-    # 5. EXTERNAL VOCABULARY
-    # --------------------------------------------------------------
-
-    st.write(
-        "📚 Loading external skill vocabulary..."
-    )
-
-    vocabulary = load_external_skill_vocabulary()
-
-    if not vocabulary:
+    if vocabulary is None:
 
         st.warning(
-            "No external skill vocabulary was found."
+            "Skill matching is disabled: "
+            + vocabulary_error
         )
 
     else:
 
         st.success(
-            f"Skill vocabulary: {len(vocabulary):,}"
+            f"ESCO skills: {vocabulary.skill_count:,}"
+        )
+
+    scorer = load_scorer(
+        scorer_signature()
+    )
+
+    st.write(
+        f"⚖️ Scoring: {scorer.description}"
+    )
+
+    # --------------------------------------------------------------
+    # 4. JOB CORPUS (embeddings + job skills, fingerprinted caches)
+    # --------------------------------------------------------------
+
+    st.write(
+        "⚡ Loading job embeddings and skills..."
+    )
+
+    corpus = load_corpus(
+        jobs_signature(),
+        vocabulary_signature(),
+        jobs,
+        vocabulary,
+        model
+    )
+
+    for note in corpus.notes:
+
+        st.info(
+            note
         )
 
     # --------------------------------------------------------------
-    # 6. RESUME SKILLS
+    # 5. RESUME SKILLS (ESCO skills table only)
     # --------------------------------------------------------------
 
     st.write(
         "🔎 Extracting resume skills..."
     )
 
-    resume_skills = extract_resume_skills(
+    resume_skill_map = resume_skill_uris(
         resume_text,
         vocabulary
+    )
+
+    resume_skills = sorted(
+        resume_skill_map.values(),
+        key=str.lower
     )
 
     st.success(
@@ -1387,50 +744,33 @@ def analyze_resume(
     )
 
     # --------------------------------------------------------------
-    # 7. RESUME EMBEDDING
+    # 6. RESUME EMBEDDING
     # --------------------------------------------------------------
 
     st.write(
         "🧠 Generating resume semantic embedding..."
     )
 
-    resume_embedding = generate_resume_embedding(
-        resume_text,
-        model
-    )
+    resume_embedding = model.encode(
+        [resume_text],
+        normalize_embeddings=True,
+        convert_to_numpy=True
+    )[0].astype(np.float32)
 
     # --------------------------------------------------------------
-    # 8. JOB SKILL EVIDENCE
-    # --------------------------------------------------------------
-
-    st.write(
-        "🔍 Loading job skill evidence..."
-    )
-
-    job_skill_evidence = (
-        load_or_build_job_skill_evidence(
-            jobs,
-            title_col,
-            description_col,
-            vocabulary
-        )
-    )
-
-    # --------------------------------------------------------------
-    # 9. RANKING
+    # 7. SCORE AND RANK (shared scoring definition)
     # --------------------------------------------------------------
 
     st.write(
         "📈 Calculating job similarity and ranking..."
     )
 
-    ranked = calculate_rankings(
-        jobs,
-        job_embeddings,
-        resume_embedding,
-        job_skill_evidence,
-        resume_skills,
-        title_col
+    ranked = rank_jobs(
+        corpus,
+        resume_text=resume_text,
+        resume_embedding=resume_embedding,
+        resume_skills=resume_skill_map.keys(),
+        scorer=scorer
     )
 
     top = ranked.head(
@@ -1438,43 +778,56 @@ def analyze_resume(
     ).copy()
 
     # --------------------------------------------------------------
-    # 10. ADD JOB METADATA
+    # 8. ADD JOB METADATA AND SKILL BREAKDOWN FOR TOP-K
     # --------------------------------------------------------------
 
-    for idx in top.index:
+    columns = corpus.columns
 
-        row_index = int(
-            top.loc[idx, "row_index"]
-        )
+    companies = []
+    locations = []
+    descriptions = []
+    matched_lists = []
+    gap_lists = []
 
-        row = jobs.iloc[
+    for row_index in top["row_index"].astype(int):
+
+        row = corpus.frame.iloc[
             row_index
         ]
 
-        top.loc[idx, "company"] = (
-            clean_text(
-                row[company_col]
-            )
-            if company_col
+        companies.append(
+            clean_text(row[columns["company"]])
+            if columns["company"]
             else ""
         )
 
-        top.loc[idx, "location"] = (
-            clean_text(
-                row[location_col]
-            )
-            if location_col
+        locations.append(
+            clean_text(row[columns["location"]])
+            if columns["location"]
             else ""
         )
 
-        top.loc[idx, "description"] = (
-            clean_text(
-                row[description_col]
-            )
+        descriptions.append(
+            clean_text(row[columns["description"]])
         )
+
+        matched, gaps = skill_breakdown(
+            corpus,
+            row_index,
+            resume_skill_map
+        )
+
+        matched_lists.append(matched)
+        gap_lists.append(gaps)
+
+    top["company"] = companies
+    top["location"] = locations
+    top["description"] = descriptions
+    top["matched_skills"] = matched_lists
+    top["skill_gaps"] = gap_lists
 
     # --------------------------------------------------------------
-    # 11. GROQ EXPLANATIONS
+    # 9. GROQ EXPLANATIONS
     # --------------------------------------------------------------
 
     client = get_groq_client()
@@ -1523,6 +876,10 @@ def analyze_resume(
         "resume_skills": resume_skills,
         "all_recommendations": ranked,
         "top_recommendations": top,
+        "scoring_method": scorer.method,
+        "scoring_description": scorer.description,
+        "extraction": extraction.to_record(),
+        "skill_matching_enabled": vocabulary is not None,
     }
 
 
@@ -1558,6 +915,30 @@ def display_results(
         '<div class="section-title">📊 Resume Overview</div>',
         unsafe_allow_html=True
     )
+
+    st.caption(
+        "Scoring: "
+        + result.get(
+            "scoring_description",
+            "unknown"
+        )
+    )
+
+    if result.get("extraction", {}).get("ocr_used"):
+
+        st.caption(
+            "Text source: OCR ("
+            + str(result["extraction"].get("ocr_engine"))
+            + ")"
+        )
+
+    if not result.get("skill_matching_enabled", True):
+
+        st.warning(
+            "No ESCO skills file was available, so skills were not "
+            "detected and jobs were ranked on semantic and lexical "
+            "similarity only."
+        )
 
     c1, c2, c3, c4 = st.columns(4)
 
@@ -1664,6 +1045,20 @@ def display_results(
                     )
                 )
 
+            if result.get("scoring_method") == mc.METHOD_MODEL:
+
+                # A trained model's score is not a percentage of
+                # requirements met; show the transparent formula next to
+                # it so the number can be sanity-checked.
+                st.caption(
+                    "Trained-model score (similarity to same-category "
+                    "pairs, not a hiring probability). Transparent formula "
+                    "score for comparison: "
+                    + score_percent(
+                        row["formula_match_score"]
+                    )
+                )
+
             if row["company"]:
 
                 st.write(
@@ -1697,11 +1092,9 @@ def display_results(
                 "### 💡 Why This Job Matches"
             )
 
+            # LLM text is rendered as Markdown, never as raw HTML.
             st.markdown(
-                f'<div class="explanation">'
-                f'{row["explanation"]}'
-                f'</div>',
-                unsafe_allow_html=True
+                row["explanation"]
             )
 
             st.markdown(
@@ -1808,6 +1201,10 @@ def display_results(
         errors="ignore"
     )
 
+    export_df["resume_skills_detected"] = ", ".join(
+        resume_skills
+    )
+
     csv_data = export_df.to_csv(
         index=False
     )
@@ -1835,7 +1232,7 @@ def render_sidebar():
 
         st.caption(
             "AI-powered resume analysis using "
-            "semantic matching and external skill evidence."
+            "semantic matching and ESCO skill evidence."
         )
 
         st.divider()
@@ -1845,13 +1242,13 @@ def render_sidebar():
         )
 
         pipeline = [
-            "Resume text extraction",
-            "External skill vocabulary",
+            "Resume text extraction (OCR for scans)",
+            "ESCO skill vocabulary (skills only)",
             "Skill extraction",
             "Semantic embedding",
             "Job similarity",
             "Skill matching",
-            "Hybrid ranking",
+            "Hybrid scoring and ranking",
             "Evidence-based explanation",
         ]
 
@@ -1859,6 +1256,99 @@ def render_sidebar():
 
             st.write(
                 f"• {item}"
+            )
+
+        st.divider()
+
+        st.subheader(
+            "⚖️ Scoring"
+        )
+
+        try:
+
+            scorer = load_scorer(
+                scorer_signature()
+            )
+
+            if scorer.uses_model:
+
+                st.success(
+                    "Trained model\n\n"
+                    + scorer.description
+                )
+
+            else:
+
+                st.info(
+                    scorer.description
+                )
+
+        except Exception as exc:
+
+            st.write(
+                f"Scorer unavailable: {exc}"
+            )
+
+        st.divider()
+
+        st.subheader(
+            "📚 Skills"
+        )
+
+        try:
+
+            vocabulary, vocabulary_error = load_vocabulary(
+                vocabulary_signature()
+            )
+
+            if vocabulary is None:
+
+                st.warning(
+                    "No ESCO skills file found. "
+                    "Skill matching is off."
+                )
+
+            else:
+
+                st.write(
+                    f"{vocabulary.skill_count:,} ESCO skills "
+                    f"({Path(vocabulary.source).name})"
+                )
+
+        except Exception:
+
+            st.write(
+                "Skill vocabulary unavailable"
+            )
+
+        st.divider()
+
+        st.subheader(
+            "🖼️ Scanned PDFs"
+        )
+
+        try:
+
+            ocr = pdf_text.ocr_engine_status()
+
+            if ocr["selected"]:
+
+                st.write(
+                    f"OCR engine: {ocr['selected']}"
+                )
+
+            else:
+
+                st.warning(
+                    "No OCR engine installed - scanned (image-only) "
+                    "PDFs cannot be read. "
+                    + str(ocr.get("hint") or "")
+                )
+
+        except Exception:
+
+            st.write(
+                "OCR status unavailable"
             )
 
         st.divider()
@@ -1923,7 +1413,7 @@ def main():
     uploaded_file = st.file_uploader(
         "📤 Upload your resume as a PDF",
         type=["pdf"],
-        help="Upload a text-based PDF resume."
+        help="Text-based or scanned PDF. Scanned (image-only) pages are read with OCR when an OCR engine is installed."
     )
 
     top_k = st.selectbox(
@@ -1962,7 +1452,7 @@ def main():
 
         file_hash = hashlib.md5(
             resume_bytes
-        ).hexdigest()
+        ).hexdigest() + f":{top_k}"
 
         previous_hash = st.session_state.get(
             "resume_hash"
@@ -2001,6 +1491,18 @@ def main():
 
                 st.success(
                     "Resume analysis completed successfully."
+                )
+
+            except ResumeReadError as exc:
+
+                # Expected user-facing problem (scanned PDF without OCR,
+                # empty file, ...): explain it, no stack trace.
+                st.error(
+                    "This resume could not be read."
+                )
+
+                st.warning(
+                    str(exc)
                 )
 
             except Exception as exc:

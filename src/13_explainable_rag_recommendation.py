@@ -6,55 +6,46 @@ USER-FACING EXPLAINABLE RAG RECOMMENDATION PIPELINE
 
 PURPOSE
 -------
-This step is the actual uploaded-resume analysis pipeline.
+Command-line version of the uploaded-resume analysis. It uses the SAME
+shared modules as the Streamlit app (14_app.py), so a resume gets the
+same skills, the same scores and the same ranking from either:
 
-USER INPUT
-----------
-data/test_resume.pdf
+    pdf_text.py        PDF text extraction with OCR fallback for
+                       scanned / image-only resumes
+    esco_vocab.py      skill vocabulary = ESCO skills table only
+    job_ranker.py      embeddings, skill/lexical signals, ranking
+    matching_core.py   the ONE scoring definition: trained
+                       HistGradientBoostingRegressor when
+                       models/match_regressor.joblib exists (Step 10b),
+                       otherwise the transparent weighted formula
+
+USAGE
+-----
+python src/13_explainable_rag_recommendation.py [path/to/resume.pdf]
+
+Default resume: data/test_resume.pdf
 
 PIPELINE
 --------
 PDF Resume
-    ↓
-Resume Text Extraction
-    ↓
-Skill Extraction
-    ↓
-Resume Semantic Embedding
-    ↓
-Actual Job Dataset
-    ↓
-Cached Job Embeddings
-    ↓
-Semantic Similarity
-    ↓
-Skill Matching
-    ↓
-Hybrid Recommendation Score
-    ↓
-Job Ranking
-    ↓
-Top-K Jobs
-    ↓
-Groq LLM Explanation
-    ↓
-User-Facing Recommendation Output
+    -> Text extraction (OCR fallback if the PDF is scanned)
+    -> ESCO skill extraction
+    -> Resume semantic embedding
+    -> Job dataset + cached job embeddings (fingerprinted cache)
+    -> Shared hybrid scoring (model or formula) and ranking
+    -> Top-K jobs
+    -> Groq explanation (explanation only; fallback if unavailable)
+    -> Recommendation files
 
 IMPORTANT
 ---------
 - User uploads ONE resume.
-- No manual annotation.
-- No pseudo-labels.
-- No ground-truth hiring labels.
+- No manual annotation. No pseudo-labels. No ground-truth hiring labels.
 - No hiring probability.
-- LLM does NOT determine ranking.
-- LLM does NOT create the matching score.
+- LLM does NOT determine ranking and does NOT create the score.
 - LLM only explains already-computed matching evidence.
-- Actual resume text is used.
-- Actual job title and description are used.
-- Skill gaps are calculated from actual available evidence.
+- Skill gaps come from ESCO skills found in the job text/skill set.
 - Groq failure does NOT stop the pipeline.
-- Deterministic fallback explanations are used if Groq is unavailable.
 
 OUTPUT
 ------
@@ -68,22 +59,15 @@ reports/
 
 CACHE
 -----
-data/cache/job_embeddings.npy
-
-DEFAULT MODEL
--------------
-all-MiniLM-L6-v2
-
-GROQ MODEL
-----------
-openai/gpt-oss-20b
+data/cache/job_embeddings.npy (+ .meta.json)
+data/cache/job_skill_index.json
 ======================================================================
 """
 
 import os
 import re
+import sys
 import json
-import hashlib
 import warnings
 from pathlib import Path
 
@@ -93,6 +77,16 @@ import pandas as pd
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 
+import matching_core as mc
+import pdf_text
+from esco_vocab import load_esco_vocabulary
+from job_ranker import (
+    build_job_corpus,
+    rank_jobs,
+    resume_skill_uris,
+    skill_breakdown,
+)
+
 warnings.filterwarnings("ignore")
 
 
@@ -100,37 +94,37 @@ warnings.filterwarnings("ignore")
 # CONFIGURATION
 # ======================================================================
 
-BASE_DIR = Path(
-    r"C:\Users\jasme\Desktop\ai resume analyzer"
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+BASE_DIR = PROJECT_ROOT
 
 DEFAULT_RESUME_PATH = (
-    BASE_DIR
+    PROJECT_ROOT
     / "data"
     / "test_resume.pdf"
 )
 
 JOB_PATH = (
-    BASE_DIR
+    PROJECT_ROOT
     / "data"
     / "jobs"
     / "all_job_post.csv"
 )
 
 CACHE_DIR = (
-    BASE_DIR
+    PROJECT_ROOT
     / "data"
     / "cache"
 )
 
 OUTPUT_DIR = (
-    BASE_DIR
+    PROJECT_ROOT
     / "data"
     / "recommendations"
 )
 
 REPORT_DIR = (
-    BASE_DIR
+    PROJECT_ROOT
     / "reports"
 )
 
@@ -160,7 +154,7 @@ REPORT_PATH = (
 )
 
 SEMANTIC_MODEL_NAME = (
-    "all-MiniLM-L6-v2"
+    mc.SEMANTIC_MODEL_NAME
 )
 
 TOP_K = 10
@@ -171,18 +165,13 @@ MAX_RESUME_CHARS_FOR_LLM = 6000
 
 MAX_JOB_CHARS_FOR_LLM = 5000
 
-GROQ_MODEL = os.getenv(
-    "GROQ_MODEL",
-    "openai/gpt-oss-20b"
-)
-
 
 # ======================================================================
 # LOAD ENVIRONMENT
 # ======================================================================
 
 load_dotenv(
-    BASE_DIR / ".env"
+    PROJECT_ROOT / ".env"
 )
 
 GROQ_API_KEY = os.getenv(
@@ -430,555 +419,6 @@ def clean_list(values):
             )
 
     return result
-
-
-def normalize_signal(
-    value,
-    minimum=0.0,
-    maximum=1.0
-):
-
-    value = safe_float(
-        value
-    )
-
-    if maximum <= minimum:
-        return 0.0
-
-    value = (
-        value - minimum
-    ) / (
-        maximum - minimum
-    )
-
-    return float(
-        np.clip(
-            value,
-            0.0,
-            1.0
-        )
-    )
-
-
-def tokenize_text(text):
-
-    text = normalize_text(
-        text
-    ).lower()
-
-    tokens = re.findall(
-        r"[a-zA-Z][a-zA-Z0-9+#.\-]*",
-        text
-    )
-
-    return set(tokens)
-
-
-def extract_skills_from_text(
-    text,
-    vocabulary
-):
-
-    text_lower = normalize_text(
-        text
-    ).lower()
-
-    detected = []
-
-    for skill in vocabulary:
-
-        skill_clean = normalize_text(
-            skill
-        )
-
-        if not skill_clean:
-            continue
-
-        skill_lower = (
-            skill_clean.lower()
-        )
-
-        pattern = (
-            r"(?<![a-zA-Z0-9])"
-            + re.escape(skill_lower)
-            + r"(?![a-zA-Z0-9])"
-        )
-
-        if re.search(
-            pattern,
-            text_lower
-        ):
-
-            detected.append(
-                skill_clean
-            )
-
-    return clean_list(
-        detected
-    )
-
-
-# ======================================================================
-# PDF EXTRACTION
-# ======================================================================
-
-def extract_pdf_text(
-    pdf_path
-):
-
-    try:
-
-        import pymupdf
-
-        document = pymupdf.open(
-            str(pdf_path)
-        )
-
-        pages = []
-
-        for page in document:
-
-            pages.append(
-                page.get_text()
-            )
-
-        document.close()
-
-        return normalize_text(
-            "\n".join(pages)
-        )
-
-    except ImportError:
-
-        try:
-
-            import fitz
-
-            document = fitz.open(
-                str(pdf_path)
-            )
-
-            pages = []
-
-            for page in document:
-
-                pages.append(
-                    page.get_text()
-                )
-
-            document.close()
-
-            return normalize_text(
-                "\n".join(pages)
-            )
-
-        except Exception as exc:
-
-            raise RuntimeError(
-                f"Could not extract PDF text: {exc}"
-            )
-
-    except Exception as exc:
-
-        raise RuntimeError(
-            f"Could not extract PDF text: {exc}"
-        )
-
-
-# ======================================================================
-# JOB TEXT
-# ======================================================================
-
-def build_job_text(
-    title,
-    description
-):
-
-    title = normalize_text(
-        title
-    )
-
-    description = normalize_text(
-        description
-    )
-
-    return (
-        title
-        + ". "
-        + description
-    ).strip()
-
-
-# ======================================================================
-# JOB SKILL VOCABULARY
-# ======================================================================
-
-def build_skill_vocabulary(
-    jobs,
-    title_col,
-    description_col
-):
-
-    print_header(
-        "Building skill vocabulary"
-    )
-
-    # A practical built-in vocabulary.
-    # This supplements terms already present in the job dataset.
-
-    base_skills = [
-        "python",
-        "java",
-        "c",
-        "c++",
-        "c#",
-        "javascript",
-        "typescript",
-        "html",
-        "css",
-        "sql",
-        "mysql",
-        "postgresql",
-        "mongodb",
-        "oracle",
-        "pandas",
-        "numpy",
-        "scikit-learn",
-        "tensorflow",
-        "pytorch",
-        "keras",
-        "opencv",
-        "yolo",
-        "machine learning",
-        "deep learning",
-        "computer vision",
-        "natural language processing",
-        "nlp",
-        "generative ai",
-        "genai",
-        "llm",
-        "large language model",
-        "rag",
-        "retrieval augmented generation",
-        "transformers",
-        "hugging face",
-        "github",
-        "git",
-        "docker",
-        "kubernetes",
-        "aws",
-        "azure",
-        "gcp",
-        "api",
-        "rest api",
-        "flask",
-        "django",
-        "fastapi",
-        "react",
-        "node.js",
-        "node",
-        "express",
-        "angular",
-        "vue",
-        "data analysis",
-        "data science",
-        "statistics",
-        "power bi",
-        "tableau",
-        "excel",
-        "communication",
-        "problem solving",
-        "teamwork",
-        "leadership",
-        "project management",
-        "agile",
-        "scrum"
-    ]
-
-    vocabulary = set(
-        base_skills
-    )
-
-    for _, row in jobs.iterrows():
-
-        text = build_job_text(
-            row[title_col],
-            row[description_col]
-        ).lower()
-
-        for skill in base_skills:
-
-            if skill.lower() in text:
-
-                vocabulary.add(
-                    skill
-                )
-
-    vocabulary = sorted(
-        vocabulary,
-        key=lambda x: (
-            -len(x),
-            x.lower()
-        )
-    )
-
-    print(
-        f"Skill vocabulary size: "
-        f"{len(vocabulary):,}"
-    )
-
-    return vocabulary
-
-
-# ======================================================================
-# JOB EMBEDDINGS
-# ======================================================================
-
-def create_or_load_job_embeddings(
-    jobs,
-    job_texts,
-    model
-):
-
-    CACHE_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    expected_count = len(
-        job_texts
-    )
-
-    if JOB_EMBEDDING_CACHE.exists():
-
-        try:
-
-            cached = np.load(
-                JOB_EMBEDDING_CACHE
-            )
-
-            if (
-                cached.ndim == 2
-                and
-                cached.shape[0]
-                == expected_count
-                and
-                cached.shape[1]
-                == 384
-            ):
-
-                print(
-                    "Using cached job embeddings."
-                )
-
-                print(
-                    f"Shape: {cached.shape}"
-                )
-
-                return cached
-
-            print(
-                "Existing job embedding cache "
-                "does not match current dataset."
-            )
-
-        except Exception as exc:
-
-            print(
-                "Could not load job embedding cache."
-            )
-
-            print(
-                f"Reason: {exc}"
-            )
-
-    print_header(
-        "Creating job embedding cache"
-    )
-
-    print(
-        f"Embedding {expected_count:,} jobs..."
-    )
-
-    embeddings = model.encode(
-        job_texts,
-        batch_size=JOB_EMBED_BATCH_SIZE,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    )
-
-    embeddings = np.asarray(
-        embeddings,
-        dtype=np.float32
-    )
-
-    np.save(
-        JOB_EMBEDDING_CACHE,
-        embeddings
-    )
-
-    print(
-        "Job embeddings cached at:"
-    )
-
-    print(
-        JOB_EMBEDDING_CACHE
-    )
-
-    return embeddings
-
-
-# ======================================================================
-# SKILL MATCHING
-# ======================================================================
-
-def calculate_skill_match(
-    resume_skills,
-    job_text,
-    vocabulary
-):
-
-    resume_set = {
-        x.lower()
-        for x in resume_skills
-    }
-
-    job_skills = extract_skills_from_text(
-        job_text,
-        vocabulary
-    )
-
-    job_set = {
-        x.lower()
-        for x in job_skills
-    }
-
-    matched = sorted(
-        resume_set.intersection(
-            job_set
-        )
-    )
-
-    gaps = sorted(
-        job_set.difference(
-            resume_set
-        )
-    )
-
-    if job_set:
-
-        coverage = (
-            len(matched)
-            /
-            len(job_set)
-        )
-
-    else:
-
-        coverage = 0.0
-
-    return (
-        matched,
-        gaps,
-        float(
-            np.clip(
-                coverage,
-                0.0,
-                1.0
-            )
-        ),
-        job_skills
-    )
-
-
-# ======================================================================
-# TITLE SIMILARITY
-# ======================================================================
-
-def calculate_title_signal(
-    resume_text,
-    job_title
-):
-
-    resume_tokens = tokenize_text(
-        resume_text
-    )
-
-    title_tokens = tokenize_text(
-        job_title
-    )
-
-    if not title_tokens:
-
-        return 0.0
-
-    overlap = (
-        resume_tokens
-        &
-        title_tokens
-    )
-
-    return float(
-        len(overlap)
-        /
-        len(title_tokens)
-    )
-
-
-# ======================================================================
-# HYBRID SCORE
-# ======================================================================
-
-def calculate_hybrid_score(
-    semantic_similarity,
-    skill_signal,
-    title_signal,
-    category_signal
-):
-
-    semantic = normalize_signal(
-        semantic_similarity,
-        -1.0,
-        1.0
-    )
-
-    skill = normalize_signal(
-        skill_signal
-    )
-
-    title = normalize_signal(
-        title_signal
-    )
-
-    category = normalize_signal(
-        category_signal
-    )
-
-    # Transparent weighted aggregation.
-    #
-    # Semantic similarity is the strongest general signal.
-    # Skill matching provides explicit evidence.
-    # Title similarity adds role-level relevance.
-    # Category signal is retained when available.
-
-    score = (
-        0.50 * semantic
-        +
-        0.30 * skill
-        +
-        0.15 * title
-        +
-        0.05 * category
-    )
-
-    return float(
-        np.clip(
-            score,
-            0.0,
-            1.0
-        )
-    )
 
 
 # ======================================================================
@@ -1296,12 +736,32 @@ REPORT_DIR.mkdir(
     exist_ok=True
 )
 
+CACHE_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ======================================================================
+# SCORER (trained model if present, otherwise the shared formula)
+# ======================================================================
+
+scorer = mc.MatchScorer.load()
+
+print(
+    f"Scoring: {scorer.description}"
+)
+
 
 # ======================================================================
 # RESUME INPUT
 # ======================================================================
 
-resume_path = DEFAULT_RESUME_PATH
+resume_path = (
+    Path(sys.argv[1]).expanduser()
+    if len(sys.argv) > 1
+    else DEFAULT_RESUME_PATH
+)
 
 print(
     f"Resume file: {resume_path}"
@@ -1318,14 +778,47 @@ print(
     "Extracting resume text..."
 )
 
-resume_text = extract_pdf_text(
+ocr_status = pdf_text.ocr_engine_status()
+
+print(
+    "OCR engine for scanned PDFs: "
+    + (
+        ocr_status["selected"]
+        if ocr_status["selected"]
+        else "none installed"
+    )
+)
+
+extraction = pdf_text.extract_pdf_text(
     resume_path
 )
 
-if not resume_text:
+if not extraction.usable:
 
-    raise ValueError(
-        "No text could be extracted from the PDF."
+    # Scanned PDF without OCR, empty PDF, unreadable file: say exactly
+    # what is wrong instead of continuing with an empty resume.
+    raise SystemExit(
+        "Could not read the resume: "
+        + extraction.user_message()
+    )
+
+resume_text = extraction.text
+
+if extraction.warnings:
+
+    for warning in extraction.warnings:
+
+        print(
+            f"WARNING: {warning}"
+        )
+
+if extraction.ocr_used:
+
+    print(
+        f"OCR used on pages {extraction.ocr_pages} "
+        f"with {extraction.ocr_engine} "
+        f"(mean confidence "
+        f"{extraction.mean_ocr_confidence})"
     )
 
 print(
@@ -1358,66 +851,6 @@ print(
 )
 
 
-job_id_col = find_column(
-    jobs,
-    ["job_id"]
-)
-
-job_title_col = find_column(
-    jobs,
-    [
-        "job_title",
-        "title",
-        "job"
-    ]
-)
-
-job_description_col = find_column(
-    jobs,
-    [
-        "job_description",
-        "description",
-        "job_desc"
-    ]
-)
-
-job_company_col = find_column(
-    jobs,
-    [
-        "company",
-        "company_name",
-        "employer"
-    ],
-    required=False
-)
-
-job_location_col = find_column(
-    jobs,
-    [
-        "location",
-        "job_location",
-        "city"
-    ],
-    required=False
-)
-
-
-# ======================================================================
-# BUILD JOB TEXT
-# ======================================================================
-
-job_texts = []
-
-for _, row in jobs.iterrows():
-
-    job_texts.append(
-        build_job_text(
-            row[job_title_col],
-            row[job_description_col]
-        )
-    )
-
-
 # ======================================================================
 # LOAD SEMANTIC MODEL
 # ======================================================================
@@ -1435,30 +868,86 @@ model = SentenceTransformer(
 )
 
 
+def encode(texts):
+
+    return np.asarray(
+        model.encode(
+            list(texts),
+            batch_size=JOB_EMBED_BATCH_SIZE,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        ),
+        dtype=np.float32
+    )
+
+
 # ======================================================================
-# JOB EMBEDDINGS
+# SKILL VOCABULARY (ESCO skills table only)
 # ======================================================================
 
-job_embeddings = (
-    create_or_load_job_embeddings(
-        jobs,
-        job_texts,
-        model
-    )
+print_header(
+    "LOADING ESCO SKILL VOCABULARY"
 )
 
+try:
 
-# ======================================================================
-# SKILL VOCABULARY
-# ======================================================================
+    vocabulary = load_esco_vocabulary()
 
-skill_vocabulary = (
-    build_skill_vocabulary(
-        jobs,
-        job_title_col,
-        job_description_col
+    print(
+        f"ESCO skills file: {vocabulary.source}"
     )
+
+    print(
+        f"ESCO skills: {vocabulary.skill_count:,} | "
+        f"matching terms: {vocabulary.term_count:,}"
+    )
+
+except (FileNotFoundError, ValueError) as exc:
+
+    vocabulary = None
+
+    print(
+        f"WARNING: {exc}"
+    )
+
+    print(
+        "Skill matching is disabled; jobs are ranked on "
+        "semantic and lexical similarity only."
+    )
+
+
+# ======================================================================
+# JOB CORPUS (embeddings + job skill sets, fingerprinted caches)
+# ======================================================================
+
+print_header(
+    "PREPARING JOB EMBEDDINGS AND SKILLS"
 )
+
+corpus = build_job_corpus(
+    jobs,
+    encode=encode,
+    model_name=SEMANTIC_MODEL_NAME,
+    vocabulary=vocabulary,
+    cache_dir=CACHE_DIR,
+    progress=lambda message, fraction: print(
+        f"  {message} ({fraction:.0%})"
+    ),
+)
+
+for note in corpus.notes:
+
+    print(
+        f"NOTE: {note}"
+    )
+
+job_columns = corpus.columns
+
+job_title_col = job_columns["title"]
+job_description_col = job_columns["description"]
+job_company_col = job_columns["company"]
+job_location_col = job_columns["location"]
 
 
 # ======================================================================
@@ -1469,11 +958,14 @@ print_header(
     "EXTRACTING RESUME SKILLS"
 )
 
-resume_skills = (
-    extract_skills_from_text(
-        resume_text,
-        skill_vocabulary
-    )
+resume_skill_map = resume_skill_uris(
+    resume_text,
+    vocabulary
+)
+
+resume_skills = sorted(
+    resume_skill_map.values(),
+    key=str.lower
 )
 
 print(
@@ -1522,93 +1014,60 @@ print(
 
 
 # ======================================================================
-# SEMANTIC SIMILARITY
+# SCORE AND RANK JOBS (shared scoring definition)
 # ======================================================================
 
 print_header(
-    "CALCULATING SEMANTIC JOB SIMILARITY"
+    "SCORING AND RANKING JOBS"
 )
 
-semantic_scores = (
-    job_embeddings
-    @
-    resume_embedding
+ranked = rank_jobs(
+    corpus,
+    resume_text=resume_text,
+    resume_embedding=resume_embedding,
+    resume_skills=resume_skill_map.keys(),
+    scorer=scorer
 )
 
-semantic_scores = np.asarray(
-    semantic_scores,
-    dtype=np.float32
+scoring_method = (
+    ranked["scoring_method"].iloc[0]
+    if len(ranked)
+    else scorer.method
 )
 
-
-# ======================================================================
-# MATCH JOBS
-# ======================================================================
-
-print_header(
-    "CALCULATING SKILL MATCHES AND GAPS"
+print(
+    f"Scoring method: {scoring_method}"
 )
 
 results = []
 
-for index, row in jobs.iterrows():
+for _, scored in ranked.iterrows():
 
-    job_id = row[
-        job_id_col
+    row_index = int(
+        scored["row_index"]
+    )
+
+    row = corpus.frame.iloc[
+        row_index
     ]
 
-    job_title = normalize_text(
-        row[job_title_col]
-    )
-
-    job_description = normalize_text(
-        row[job_description_col]
-    )
-
-    job_text = build_job_text(
-        job_title,
-        job_description
-    )
-
-    semantic_similarity = (
-        safe_float(
-            semantic_scores[index]
-        )
-    )
-
-    matched_skills, skill_gaps, skill_coverage, job_skills = (
-        calculate_skill_match(
-            resume_skills,
-            job_text,
-            skill_vocabulary
-        )
-    )
-
-    title_signal = (
-        calculate_title_signal(
-            resume_text,
-            job_title
-        )
-    )
-
-    # Category signal is intentionally neutral when the
-    # job dataset does not provide a reliable category field.
-    category_signal = 0.0
-
-    hybrid_score = (
-        calculate_hybrid_score(
-            semantic_similarity,
-            skill_coverage,
-            title_signal,
-            category_signal
-        )
+    matched_skills, skill_gaps = skill_breakdown(
+        corpus,
+        row_index,
+        resume_skill_map
     )
 
     results.append(
         {
-            "job_id": job_id,
-            "job_title": job_title,
-            "job_description": job_description,
+            "job_id": scored["job_id"],
+
+            "job_title": normalize_text(
+                row[job_title_col]
+            ),
+
+            "job_description": normalize_text(
+                row[job_description_col]
+            ),
 
             "company": (
                 normalize_text(
@@ -1627,16 +1086,19 @@ for index, row in jobs.iterrows():
             ),
 
             "semantic_similarity":
-                semantic_similarity,
+                float(scored["semantic_similarity"]),
 
             "skill_match_signal":
-                skill_coverage,
+                float(scored["skill_match_signal"]),
 
             "title_similarity":
-                title_signal,
+                float(scored["title_similarity"]),
 
-            "category_match_signal":
-                category_signal,
+            "text_containment":
+                float(scored["text_containment"]),
+
+            "shared_skill_count":
+                int(scored["shared_skill_count"]),
 
             "matched_skills":
                 json.dumps(
@@ -1651,7 +1113,13 @@ for index, row in jobs.iterrows():
                 ),
 
             "hybrid_match_score":
-                hybrid_score
+                float(scored["hybrid_match_score"]),
+
+            "scoring_method":
+                scored["scoring_method"],
+
+            "recommendation_rank":
+                int(scored["recommendation_rank"]),
         }
     )
 
@@ -1668,26 +1136,8 @@ recommendations = pd.DataFrame(
     results
 )
 
-recommendations = (
-    recommendations
-    .sort_values(
-        "hybrid_match_score",
-        ascending=False
-    )
-    .reset_index(
-        drop=True
-    )
-)
-
-recommendations[
-    "recommendation_rank"
-] = (
-    np.arange(
-        1,
-        len(recommendations) + 1
-    )
-)
-
+# rank_jobs already returned the jobs best-first with a deterministic
+# tie-break; recommendation_rank is its rank column.
 recommendations[
     "is_top10"
 ] = (
@@ -1931,6 +1381,13 @@ for _, row in top10.iterrows():
                 4
             ),
 
+            "scoring_method":
+                str(
+                    row[
+                        "scoring_method"
+                    ]
+                ),
+
             "semantic_similarity": round(
                 safe_float(
                     row[
@@ -1994,7 +1451,10 @@ analysis = {
             len(resume_skills),
 
         "skill_list":
-            resume_skills
+            resume_skills,
+
+        "pdf_extraction":
+            extraction.to_record()
     },
 
     "job_dataset": {
@@ -2017,25 +1477,39 @@ analysis = {
                 resume_embedding.shape[0]
             ),
 
-        "job_embeddings_cached":
-            True
+        "job_embeddings_cache":
+            str(JOB_EMBEDDING_CACHE)
+    },
+
+    "skill_vocabulary": {
+        "source":
+            vocabulary.source if vocabulary else None,
+
+        "skills_table_only":
+            True,
+
+        "skill_count":
+            vocabulary.skill_count if vocabulary else 0
     },
 
     "matching": {
         "ranking_signal":
-            "transparent hybrid score",
+            "hybrid_match_score from matching_core.MatchScorer",
 
-        "semantic_weight":
-            0.50,
+        "scoring_method":
+            scoring_method,
 
-        "skill_weight":
-            0.30,
+        "scorer":
+            scorer.description,
 
-        "title_weight":
-            0.15,
+        "trained_model_in_use":
+            bool(scorer.uses_model),
 
-        "category_weight":
-            0.05,
+        "formula_weights":
+            mc.WEIGHTS,
+
+        "category_weight_redistributed":
+            True,
 
         "ranking_changed_by_llm":
             False,
@@ -2173,22 +1647,28 @@ report = {
             JOB_EMBEDDING_CACHE
         ),
 
+    "job_corpus_fingerprint":
+        corpus.fingerprint,
+
     "ranking": {
         "method":
-            "explicit weighted hybrid aggregation",
+            scoring_method,
 
-        "semantic_weight":
-            0.50,
+        "scorer":
+            scorer.description,
 
-        "skill_weight":
-            0.30,
+        "trained_model_in_use":
+            bool(scorer.uses_model),
 
-        "title_weight":
-            0.15,
+        "formula_weights_if_no_model":
+            mc.WEIGHTS,
 
-        "category_weight":
-            0.05
+        "shared_with_streamlit_app":
+            True
     },
+
+    "pdf_extraction":
+        extraction.to_record(),
 
     "llm": {
         "provider":
@@ -2316,6 +1796,10 @@ print(
 print(
     f"Mean Top-{TOP_K} score: "
     f"{top10['hybrid_match_score'].mean():.4f}"
+)
+
+print(
+    f"Scoring method: {scoring_method}"
 )
 
 print(

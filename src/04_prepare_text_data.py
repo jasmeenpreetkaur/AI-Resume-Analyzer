@@ -4,10 +4,22 @@ Step 4: Prepare Resume and Job Text Data
 
 Purpose:
 - Load cleaned resume and job datasets.
+- Use the PDF parser output (Step 3, resumes_parsed.jsonl) as the resume
+  text whenever a PDF was parsed successfully; fall back to the CSV text
+  (Resume_str) only for resumes with no usable parsed PDF.
 - Normalize text safely.
 - Parse job_skill_set into structured lists.
 - Create unified text fields.
 - Generate a processing report.
+
+Why the parsed PDFs are the primary resume text
+-----------------------------------------------
+The Streamlit app and Step 13 read uploaded PDFs with the same shared
+extractor Step 3 uses (``pdf_text``, with OCR for scanned pages). If the
+offline pipeline were built from the CSV text instead, the models and
+signals would be calibrated on a different extraction than the one real
+users' resumes go through, and Step 3's output (including OCR results)
+would never be used by anything.
 
 This step does NOT:
 - extract skills
@@ -39,6 +51,15 @@ REPORTS_DIR = PROJECT_ROOT / "reports"
 
 RESUME_INPUT = PROCESSED_DIR / "resumes_clean.csv"
 JOB_INPUT = PROCESSED_DIR / "jobs_clean.csv"
+
+# Step 3 output (03_resume_parser.py)
+PARSED_RESUMES_INPUT = (
+    PROCESSED_DIR / "resume_parsed" / "resumes_parsed.jsonl"
+)
+
+# Resumes that exist as parsed PDFs but have no row in resumes_clean.csv
+# are still part of the corpus.
+INCLUDE_PDF_ONLY_RESUMES = True
 
 RESUME_OUTPUT = PROCESSED_DIR / "resumes_text_processed.csv"
 JOB_OUTPUT = PROCESSED_DIR / "jobs_text_processed.csv"
@@ -246,6 +267,128 @@ def validate_required_columns(
 # RESUME PROCESSING
 # ============================================================================
 
+def normalize_id(value: Any) -> str:
+    """
+    Normalise IDs only for joining the CSV and the parsed PDFs
+    (1234, "1234", 1234.0 and "1234.0" are the same resume).
+    """
+
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    text = str(value).strip()
+
+    if text.endswith(".0"):
+        head = text[:-2]
+
+        if head.isdigit():
+            return head
+
+    return text
+
+
+def count_words(text: str) -> int:
+    return len(text.split())
+
+
+def load_parsed_resumes() -> dict[str, dict]:
+    """
+    Step 3 records keyed by normalised resume_id. Empty when Step 3 has
+    not been run.
+    """
+
+    if not PARSED_RESUMES_INPUT.exists():
+        logger.warning(
+            "Parsed PDF resumes not found (%s). Run Step 3 "
+            "(03_resume_parser.py) first; using CSV text only.",
+            PARSED_RESUMES_INPUT
+        )
+        return {}
+
+    records: dict[str, dict] = {}
+    malformed = 0
+
+    with PARSED_RESUMES_INPUT.open(
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        for line in file:
+
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                malformed += 1
+                continue
+
+            resume_id = normalize_id(record.get("resume_id"))
+
+            if resume_id:
+                records[resume_id] = record
+
+    if malformed:
+        logger.warning(
+            "Skipped %d malformed lines in %s",
+            malformed,
+            PARSED_RESUMES_INPUT
+        )
+
+    logger.info(
+        "Parsed PDF resumes loaded: %d",
+        len(records)
+    )
+
+    return records
+
+
+def choose_resume_text(
+    csv_text: str,
+    parsed: dict | None
+) -> tuple[str, str]:
+    """
+    Pick the resume text and say where it came from.
+
+    pdf_parser   usable parsed PDF (text layer or OCR)
+    csv          no parsed PDF for this resume
+    csv_fallback the PDF could not be parsed (or parsed to far less
+                 text than the CSV, i.e. a low-quality extraction)
+    none         neither source has text
+    """
+
+    if parsed is None:
+        return (csv_text, "csv") if csv_text else ("", "none")
+
+    parsed_text = (
+        normalize_text(parsed.get("raw_text", ""))
+        if parsed.get("extraction_status") == "success"
+        else ""
+    )
+
+    if not parsed_text:
+        return (
+            (csv_text, "csv_fallback")
+            if csv_text
+            else ("", "none")
+        )
+
+    if (
+        parsed.get("extraction_quality") == "low"
+        and csv_text
+        and count_words(csv_text) > count_words(parsed_text)
+    ):
+        return csv_text, "csv_fallback"
+
+    return parsed_text, "pdf_parser"
+
+
 def process_resumes() -> tuple[pd.DataFrame, dict]:
 
     logger.info("")
@@ -253,69 +396,163 @@ def process_resumes() -> tuple[pd.DataFrame, dict]:
     logger.info("Processing resumes")
     logger.info("=" * 70)
 
-    if not RESUME_INPUT.exists():
+    parsed_records = load_parsed_resumes()
+
+    csv_exists = RESUME_INPUT.exists()
+
+    if not csv_exists and not parsed_records:
         raise FileNotFoundError(
-            f"Resume dataset not found: {RESUME_INPUT}"
+            f"Resume dataset not found: {RESUME_INPUT} "
+            f"(and no parsed PDFs at {PARSED_RESUMES_INPUT})"
         )
 
-    df = pd.read_csv(RESUME_INPUT)
-
-    original_rows = len(df)
-
-    # Normalize column names.
-    df = normalize_column_names(df)
-
-    logger.info(
-        "Original shape: %d rows × %d columns",
-        df.shape[0],
-        df.shape[1]
-    )
-
-    logger.info(
-        "Detected columns: %s",
-        list(df.columns)
-    )
-
-    validate_required_columns(
-        df,
-        ["resume_str"],
-        "Resume dataset"
-    )
+    rows: list[dict] = []
+    original_rows = 0
+    seen_ids: set[str] = set()
+    category_disagreements = 0
 
     # ------------------------------------------------------------------------
-    # Create output
+    # CSV rows (text from the parsed PDF where available)
     # ------------------------------------------------------------------------
 
-    output = pd.DataFrame()
+    if csv_exists:
 
-    # Preserve source ID.
-    if "id" in df.columns:
-        output["resume_id"] = df["id"]
+        df = pd.read_csv(RESUME_INPUT)
 
-    elif "resume_id" in df.columns:
-        output["resume_id"] = df["resume_id"]
+        original_rows = len(df)
 
-    else:
-        output["resume_id"] = range(1, len(df) + 1)
+        df = normalize_column_names(df)
 
-    # Preserve category.
-    if "category" in df.columns:
-        output["category"] = df["category"].apply(
-            normalize_text
+        logger.info(
+            "Original shape: %d rows × %d columns",
+            df.shape[0],
+            df.shape[1]
         )
-    else:
-        output["category"] = ""
 
-    # Process resume text.
-    output["resume_text"] = df["resume_str"].apply(
-        normalize_text
+        logger.info(
+            "Detected columns: %s",
+            list(df.columns)
+        )
+
+        validate_required_columns(
+            df,
+            ["resume_str"],
+            "Resume dataset"
+        )
+
+        for position, source in enumerate(
+            df.to_dict("records"),
+            start=1
+        ):
+
+            if "id" in source:
+                raw_id = source["id"]
+            elif "resume_id" in source:
+                raw_id = source["resume_id"]
+            else:
+                raw_id = position
+
+            key = normalize_id(raw_id)
+
+            parsed = parsed_records.get(key)
+
+            csv_text = normalize_text(source.get("resume_str"))
+
+            text, text_source = choose_resume_text(
+                csv_text,
+                parsed
+            )
+
+            csv_category = (
+                normalize_text(source.get("category"))
+                if "category" in source
+                else ""
+            )
+
+            parsed_category = (
+                normalize_text(parsed.get("category"))
+                if parsed
+                else ""
+            )
+
+            if (
+                csv_category
+                and parsed_category
+                and csv_category.lower() != parsed_category.lower()
+            ):
+                category_disagreements += 1
+
+            row = {
+                "resume_id": raw_id,
+                "category": csv_category or parsed_category,
+                "resume_text": text,
+                "text_source": text_source,
+                "pdf_extraction_quality": (
+                    parsed.get("extraction_quality", "")
+                    if parsed
+                    else ""
+                ),
+                "ocr_used": bool(parsed and parsed.get("ocr_used")),
+            }
+
+            if "resume_html" in source:
+                row["resume_html"] = normalize_text(
+                    source.get("resume_html")
+                )
+
+            rows.append(row)
+            seen_ids.add(key)
+
+    # ------------------------------------------------------------------------
+    # Parsed PDFs that have no CSV row
+    # ------------------------------------------------------------------------
+
+    pdf_only = 0
+
+    if INCLUDE_PDF_ONLY_RESUMES:
+
+        for key, parsed in parsed_records.items():
+
+            if key in seen_ids:
+                continue
+
+            text, text_source = choose_resume_text("", parsed)
+
+            # Keep PDF-only resumes even when extraction returns no text.
+            # This can happen when OCR is unavailable for scanned PDFs.
+            rows.append(
+                {
+                    "resume_id": parsed.get("resume_id"),
+                    "category": normalize_text(parsed.get("category")),
+                    "resume_text": text,
+                    "text_source": text_source,
+                    "pdf_extraction_quality": parsed.get(
+                        "extraction_quality",
+                        ""
+                    ),
+                    "ocr_used": bool(parsed.get("ocr_used")),
+                }
+            )
+
+            pdf_only += 1
+
+    output = pd.DataFrame(rows)
+
+    # IDs that are all digits stay numeric, as they were when they came
+    # straight from the CSV.
+    numeric_ids = pd.to_numeric(
+        output["resume_id"],
+        errors="coerce"
     )
 
-    # Preserve HTML if available.
-    if "resume_html" in df.columns:
-        output["resume_html"] = df["resume_html"].apply(
-            normalize_text
-        )
+    if len(output) and not numeric_ids.isna().any():
+        output["resume_id"] = numeric_ids.astype("int64")
+
+    if "resume_html" in output.columns:
+        output["resume_html"] = output["resume_html"].fillna("")
+
+    if not original_rows:
+        original_rows = len(output)
 
     # ------------------------------------------------------------------------
     # Statistics
@@ -326,6 +563,13 @@ def process_resumes() -> tuple[pd.DataFrame, dict]:
     empty_text_count = int(
         output["resume_text"].str.strip().eq("").sum()
     )
+
+    source_counts = {
+        str(name): int(count)
+        for name, count in output["text_source"]
+        .value_counts()
+        .items()
+    }
 
     output.to_csv(
         RESUME_OUTPUT,
@@ -338,6 +582,16 @@ def process_resumes() -> tuple[pd.DataFrame, dict]:
         output.shape[0],
         output.shape[1]
     )
+
+    logger.info(
+        "Resume text sources: %s",
+        source_counts
+    )
+
+    if not parsed_records:
+        logger.warning(
+            "No parsed PDFs were used: every resume text came from the CSV."
+        )
 
     logger.info(
         "Empty resume texts: %d",
@@ -353,6 +607,18 @@ def process_resumes() -> tuple[pd.DataFrame, dict]:
         "original_rows": original_rows,
         "output_rows": len(output),
         "empty_text_count": empty_text_count,
+        "text_source_counts": source_counts,
+        "parsed_pdf_input": (
+            str(PARSED_RESUMES_INPUT)
+            if parsed_records
+            else None
+        ),
+        "parsed_pdf_records": len(parsed_records),
+        "pdf_only_resumes_added": pdf_only,
+        "resumes_read_with_ocr": int(output["ocr_used"].sum()),
+        "category_disagreements_csv_vs_pdf_folder": (
+            category_disagreements
+        ),
         "text_length": {
             "min": (
                 int(text_lengths.min())
@@ -586,6 +852,7 @@ def create_report(
 
         "inputs": {
             "resumes": str(RESUME_INPUT),
+            "parsed_pdf_resumes": str(PARSED_RESUMES_INPUT),
             "jobs": str(JOB_INPUT)
         },
 
@@ -599,6 +866,8 @@ def create_report(
         "jobs": job_stats,
 
         "transformations": [
+            "Used Step 3 parsed PDF text as resume text "
+            "(CSV text only as fallback)",
             "Normalized column names",
             "Normalized excessive whitespace",
             "Normalized line breaks",

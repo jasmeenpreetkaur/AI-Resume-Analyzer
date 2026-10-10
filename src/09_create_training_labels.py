@@ -3,24 +3,31 @@ AI RESUME ANALYZER - STEP 9
 REAL SEMANTIC + STRUCTURED HYBRID MATCHING DATASET
 
 This version:
-- Uses ACTUAL resume text
+- Uses ACTUAL resume text (Step 4 output: parsed PDF text when available)
 - Uses ACTUAL job title + job description
 - Does NOT use constructed text representations
 - Does NOT create pseudo-labels
 - Does NOT create training labels
 - Computes semantic similarity using Sentence Transformers
-- Reuses precomputed resume/job embeddings
 - Preserves existing structured skill features
+- Computes every signal through matching_core.py, the same definitions
+  used by Step 10 (scoring), Step 13 (CLI) and the Streamlit app, so the
+  offline dataset and the online app never disagree about a formula
+
+evidence_score is the transparent weighted formula from matching_core
+(weights live in ONE place). It is an audit score, not a learned label.
 """
 
 import os
 import json
-import ast
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
+
+import matching_core as mc
 
 warnings.filterwarnings("ignore")
 
@@ -29,43 +36,23 @@ warnings.filterwarnings("ignore")
 # CONFIGURATION
 # ============================================================
 
-BASE_DIR = r"C:\Users\jasme\Desktop\ai resume analyzer"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-FEATURE_FILE = os.path.join(
-    BASE_DIR,
-    "data",
-    "processed",
-    "resume_job_features.csv"
+PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+
+FEATURE_FILE = str(PROCESSED_DIR / "resume_job_features.csv")
+
+RESUME_FILE = str(PROCESSED_DIR / "resumes_text_processed.csv")
+
+JOB_FILE = str(PROCESSED_DIR / "jobs_text_processed.csv")
+
+OUTPUT_FILE = str(PROCESSED_DIR / "resume_job_matching_dataset.csv")
+
+REPORT_FILE = str(
+    PROJECT_ROOT / "reports" / "semantic_matching_dataset_report.json"
 )
 
-RESUME_FILE = os.path.join(
-    BASE_DIR,
-    "data",
-    "processed",
-    "resumes_text_processed.csv"
-)
-
-JOB_FILE = os.path.join(
-    BASE_DIR,
-    "data",
-    "processed",
-    "jobs_text_processed.csv"
-)
-
-OUTPUT_FILE = os.path.join(
-    BASE_DIR,
-    "data",
-    "processed",
-    "resume_job_matching_dataset.csv"
-)
-
-REPORT_FILE = os.path.join(
-    BASE_DIR,
-    "reports",
-    "semantic_matching_dataset_report.json"
-)
-
-MODEL_NAME = "all-MiniLM-L6-v2"
+MODEL_NAME = mc.SEMANTIC_MODEL_NAME
 
 BATCH_SIZE = 64
 
@@ -81,26 +68,14 @@ def section(title):
 
 
 # ============================================================
-# TEXT CLEANING
+# TEXT / LEXICAL SIGNALS (shared definitions)
 # ============================================================
 
-def clean_text(value):
-    """
-    Safely convert text to a normalized string.
-    """
-    if pd.isna(value):
-        return ""
+clean_text = mc.clean_text
 
-    text = str(value)
+calculate_title_similarity = mc.title_similarity
 
-    text = text.replace("\x00", " ")
-    text = text.replace("\r", " ")
-    text = text.replace("\n", " ")
-
-    # Collapse excessive whitespace
-    text = " ".join(text.split())
-
-    return text.strip()
+calculate_text_containment = mc.text_containment
 
 
 def safe_float(value, default=0.0):
@@ -114,63 +89,6 @@ def safe_float(value, default=0.0):
 
     except Exception:
         return default
-
-
-# ============================================================
-# TITLE SIMILARITY
-# ============================================================
-
-def calculate_title_similarity(title, resume_text):
-    """
-    Lightweight lexical title signal.
-
-    This is intentionally kept separate from the transformer
-    semantic similarity.
-    """
-
-    title = clean_text(title).lower()
-    resume_text = clean_text(resume_text).lower()
-
-    if not title or not resume_text:
-        return 0.0
-
-    title_tokens = set(title.split())
-
-    if not title_tokens:
-        return 0.0
-
-    resume_tokens = set(resume_text.split())
-
-    overlap = title_tokens.intersection(resume_tokens)
-
-    return len(overlap) / len(title_tokens)
-
-
-# ============================================================
-# TEXT CONTAINMENT
-# ============================================================
-
-def calculate_text_containment(resume_text, job_text):
-    """
-    Measures the proportion of job tokens appearing in the resume.
-
-    This is a simple lexical signal and is NOT used as the
-    semantic similarity itself.
-    """
-
-    resume_text = clean_text(resume_text).lower()
-    job_text = clean_text(job_text).lower()
-
-    if not resume_text or not job_text:
-        return 0.0
-
-    resume_tokens = set(resume_text.split())
-    job_tokens = set(job_text.split())
-
-    if not job_tokens:
-        return 0.0
-
-    return len(resume_tokens.intersection(job_tokens)) / len(job_tokens)
 
 
 # ============================================================
@@ -337,11 +255,12 @@ def main():
     # BUILD ACTUAL JOB SEMANTIC TEXT
     # --------------------------------------------------------
 
-    jobs["semantic_job_text"] = (
-        jobs["job_title"] +
-        ". " +
-        jobs["job_description"]
-    ).map(clean_text)
+    # Same construction the online app and Step 13 use.
+    jobs["semantic_job_text"] = [
+        mc.build_job_text(title, description)
+        for title, description
+        in zip(jobs["job_title"], jobs["job_description"])
+    ]
 
     print(f"Job records: {len(jobs):,}")
     print(
@@ -565,17 +484,9 @@ def main():
     # Cosine similarity can technically range [-1, 1].
     # For matching features we map it into [0, 1].
 
-    semantic_similarity = (
-        semantic_scores + 1.0
-    ) / 2.0
-
-    semantic_similarity = np.clip(
-        semantic_similarity,
-        0.0,
-        1.0
+    features["semantic_similarity"] = mc.semantic_signal(
+        semantic_scores
     )
-
-    features["semantic_similarity"] = semantic_similarity
 
     # --------------------------------------------------------
     # TEXT CONTAINMENT
@@ -619,29 +530,35 @@ def main():
 
     section("Building structured skill signal")
 
-    features["skill_match_signal"] = (
-        0.40 * features["jaccard_similarity"].clip(0, 1)
-        +
-        0.30 * features["resume_skill_coverage"].clip(0, 1)
-        +
-        0.30 * features["job_skill_coverage"].clip(0, 1)
+    features["skill_match_signal"] = mc.skill_match_signal(
+        features["jaccard_similarity"].clip(0, 1),
+        features["resume_skill_coverage"].clip(0, 1),
+        features["job_skill_coverage"].clip(0, 1),
     )
 
     # --------------------------------------------------------
     # CATEGORY SIGNAL
     # --------------------------------------------------------
 
-    features["category_match_signal"] = (
-        features["resume_category"]
-        .fillna("")
-        .astype(str)
-        .str.lower()
-        ==
-        features["job_category"]
-        .fillna("")
-        .astype(str)
-        .str.lower()
-    ).astype(int)
+    # Unified definition (matching_core.category_signal_series):
+    # case/separator-insensitive, and two MISSING categories are NOT a
+    # match (the old code compared "" == "" and called it a match).
+    # category_available / category_match are rewritten here so Step 10
+    # and the report read one consistent definition.
+    category_signal, category_available = mc.category_signal_series(
+        features["resume_category"],
+        features["job_category"],
+    )
+
+    features["category_match_signal"] = category_signal.astype(int)
+    features["category_available"] = category_available.astype(int)
+    features["category_match"] = features["category_match_signal"]
+
+    print(
+        "Pairs with a usable category on both sides:",
+        f"{int(category_available.sum()):,}"
+        f" of {len(features):,}"
+    )
 
     # --------------------------------------------------------
     # HYBRID EVIDENCE SCORE
@@ -649,36 +566,15 @@ def main():
 
     section("Building transparent hybrid evidence score")
 
-    """
-    This is NOT a learned ground-truth label.
+    # This is NOT a learned ground-truth label. It is the transparent
+    # weighted formula defined once in matching_core.WEIGHTS (the same
+    # weights Step 10, Step 13 and the app use). When a pair has no
+    # usable category the category weight is redistributed instead of
+    # silently scoring the pair lower.
 
-    It is a transparent evidence aggregation:
+    features["evidence_score"] = mc.formula_score(features)
 
-    35% semantic similarity
-    25% skill match
-    15% job skill coverage
-    10% text containment
-    10% title similarity
-     5% category match
-    """
-
-    features["evidence_score"] = (
-        0.35 * features["semantic_similarity"]
-        +
-        0.25 * features["skill_match_signal"]
-        +
-        0.15 * features["job_skill_coverage"].clip(0, 1)
-        +
-        0.10 * features["text_containment"]
-        +
-        0.10 * features["title_similarity"]
-        +
-        0.05 * features["category_match_signal"]
-    )
-
-    features["evidence_score"] = features[
-        "evidence_score"
-    ].clip(0, 1)
+    print("Formula weights:", json.dumps(mc.WEIGHTS))
 
     # --------------------------------------------------------
     # SAVE FINAL DATASET
@@ -930,6 +826,9 @@ def main():
         },
 
         "evidence_score": {
+            "definition": "matching_core.formula_score",
+            "weights": mc.WEIGHTS,
+            "category_weight_redistributed_when_unknown": True,
             "mean":
                 float(
                     final_dataset["evidence_score"].mean()
@@ -938,6 +837,13 @@ def main():
                 float(
                     final_dataset["evidence_score"].median()
                 )
+        },
+
+        "category": {
+            "pairs_with_category_on_both_sides":
+                int(final_dataset["category_available"].sum()),
+            "pairs_with_matching_category":
+                int(final_dataset["category_match"].sum())
         },
 
         "pseudo_labels_created": False,
@@ -954,6 +860,8 @@ def main():
             "Embeddings are computed once per unique resume/job.",
             "Pairwise semantic similarity uses cosine similarity.",
             "Structured ESCO skill signals are preserved.",
+            "All signals are computed by matching_core.py.",
+            "Missing categories are not counted as a category match.",
             "No pseudo-labels are generated."
         ]
     }

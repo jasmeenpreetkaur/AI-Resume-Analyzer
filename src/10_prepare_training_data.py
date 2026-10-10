@@ -1,28 +1,41 @@
 """
 ======================================================================
-AI RESUME ANALYZER - STEP 10 FINAL HYBRID MATCHING MODEL
+AI RESUME ANALYZER - STEP 10 FINAL HYBRID MATCHING
 ======================================================================
 
 PURPOSE
 -------
-Generate a transparent hybrid resume-job matching score and
-resume-wise job rankings from the corrected Step 9 dataset.
+Score every resume-job pair in the Step 9 dataset and produce
+resume-wise job rankings.
+
+ONE SCORING DEFINITION
+----------------------
+The score is NOT computed here. It comes from matching_core.MatchScorer,
+the same object the Streamlit app (14_app.py) and the command-line
+analysis (13_explainable_rag_recommendation.py) use:
+
+  * models/match_regressor.joblib present and valid (written by
+    10b_train_match_model.py)  ->  the trained
+    HistGradientBoostingRegressor scores the pairs;
+  * otherwise -> the transparent weighted formula whose weights are
+    defined once in matching_core.WEIGHTS.
+
+Every output row records which one produced it (scoring_method) and also
+keeps the formula score (formula_match_score) so the two can be compared.
+Offline rankings, the app and the CLI therefore can no longer disagree
+because of a different formula or different weights.
 
 IMPORTANT
 ---------
-- Uses corrected Step 9 REAL semantic similarity.
-- Step 9 semantic similarity was generated from ACTUAL resume text.
-- Step 9 semantic similarity was generated from ACTUAL job text.
-- Raw semantic text columns are NOT required in Step 10.
-- Step 9 evidence_score is preserved ONLY for audit.
-- Step 9 evidence_score is NOT a model feature.
-- Step 9 evidence_score is NOT a training target.
-- No pseudo-labels.
-- No ground-truth hiring labels.
-- No ROC-AUC/F1.
-- No artificial supervised target.
-- No supervised model is trained.
-- Final score is a transparent weighted hybrid score.
+- This step trains nothing. Training is Step 10b.
+- Uses corrected Step 9 REAL semantic similarity (actual resume text,
+  actual job title + description).
+- Step 9 evidence_score is preserved ONLY for audit. It is not a model
+  feature and not a training target.
+- Category agreement is used by the formula when both categories are
+  known; a missing category is not treated as a mismatch (the weight is
+  redistributed), exactly as the app does for uploaded resumes.
+- No ground-truth hiring labels exist, so no ROC-AUC/F1 is reported here.
 - Resume-wise ranking is deterministic and reproducible.
 - Independent human validation follows Step 10.
 
@@ -34,14 +47,14 @@ import json
 import numpy as np
 import pandas as pd
 
+import matching_core as mc
+
 
 # =====================================================================
 # PATHS
 # =====================================================================
 
-PROJECT_ROOT = Path(
-    r"C:\Users\jasme\Desktop\ai resume analyzer"
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 INPUT_PATH = (
     PROJECT_ROOT
@@ -89,36 +102,14 @@ REPORT_DIR.mkdir(
 TOP_K_VALUES = [5, 10, 20]
 
 #
-# Explicit hybrid matching weights.
+# The weights are defined ONCE, in matching_core. They are design
+# parameters (not learned) and are the fallback scorer.
 #
-# These are NOT learned weights.
-# They are transparent design parameters.
-#
-WEIGHTS = {
-    "semantic_similarity": 0.30,
-    "skill_match_signal": 0.20,
-    "title_similarity": 0.15,
-    "category_match_signal": 0.10,
-    "job_skill_coverage": 0.10,
-    "resume_skill_coverage": 0.05,
-    "jaccard_similarity": 0.04,
-    "text_containment": 0.03,
-    "maximum_skill_overlap_ratio": 0.02,
-    "shared_skill_count_signal": 0.01,
-}
+WEIGHTS = mc.WEIGHTS
 
 WEIGHT_SUM = sum(
     WEIGHTS.values()
 )
-
-if not np.isclose(
-    WEIGHT_SUM,
-    1.0
-):
-    raise ValueError(
-        "Hybrid weights must sum to 1.0. "
-        f"Current sum = {WEIGHT_SUM}"
-    )
 
 
 # =====================================================================
@@ -193,7 +184,7 @@ def clip01(series):
 # =====================================================================
 
 print_header(
-    "AI RESUME ANALYZER - STEP 10 FINAL HYBRID MATCHING MODEL"
+    "AI RESUME ANALYZER - STEP 10 FINAL HYBRID MATCHING"
 )
 
 print("""
@@ -201,11 +192,11 @@ IMPORTANT:
 - Uses corrected Step 9 REAL semantic similarity.
 - Semantic similarity was computed from actual text in Step 9.
 - Raw semantic text columns are NOT required here.
+- Scoring comes from matching_core.MatchScorer (shared with the app).
 - Step 9 evidence_score is audit-only.
 - No pseudo-labels.
 - No ground-truth hiring labels.
-- No supervised training.
-- No ROC-AUC/F1.
+- Nothing is trained in this step (see 10b_train_match_model.py).
 """)
 
 
@@ -480,7 +471,7 @@ for column in signal_columns:
 
 
 # =====================================================================
-# NORMALIZE SIGNALS
+# NORMALIZE SIGNALS (shared definition)
 # =====================================================================
 
 print_header(
@@ -488,95 +479,31 @@ print_header(
 )
 
 #
-# Semantic similarity is already the direct Sentence Transformer
-# similarity signal generated in Step 9.
+# matching_core.signal_frame is the one place that clips signals to
+# [0, 1] and derives the shared-skill signal. The shared-skill signal
+# uses a FIXED cap (matching_core.SHARED_SKILL_CAP), not the maximum of
+# this dataset, so the same pair scores the same no matter what other
+# pairs were loaded - and the app can reproduce it for one resume.
 #
-df["_semantic_signal"] = clip01(
-    df["semantic_similarity"]
-)
+signals = mc.signal_frame(df)
 
-df["_skill_signal"] = clip01(
-    df["skill_match_signal"]
-)
+signal_map = {
+    "semantic_similarity": "_semantic_signal",
+    "skill_match_signal": "_skill_signal",
+    "title_similarity": "_title_signal",
+    "category_match_signal": "_category_signal",
+    "job_skill_coverage": "_job_coverage_signal",
+    "resume_skill_coverage": "_resume_coverage_signal",
+    "jaccard_similarity": "_jaccard_signal",
+    "text_containment": "_containment_signal",
+    "maximum_skill_overlap_ratio": "_overlap_signal",
+    "shared_skill_count_signal": "_shared_skill_signal",
+}
 
-df["_title_signal"] = clip01(
-    df["title_similarity"]
-)
+for signal_name, column_name in signal_map.items():
+    df[column_name] = signals[signal_name].to_numpy()
 
-df["_category_signal"] = clip01(
-    df["category_match_signal"]
-)
-
-df["_job_coverage_signal"] = clip01(
-    df["job_skill_coverage"]
-)
-
-df["_resume_coverage_signal"] = clip01(
-    df["resume_skill_coverage"]
-)
-
-df["_jaccard_signal"] = clip01(
-    df["jaccard_similarity"]
-)
-
-df["_containment_signal"] = clip01(
-    df["text_containment"]
-)
-
-df["_overlap_signal"] = clip01(
-    df["maximum_skill_overlap_ratio"]
-)
-
-
-# =====================================================================
-# SHARED SKILL SIGNAL
-# =====================================================================
-
-shared_skill = (
-    df["shared_skill_count"]
-    .clip(lower=0)
-)
-
-maximum_shared_skill = max(
-    float(shared_skill.max()),
-    1.0
-)
-
-df["_shared_skill_signal"] = (
-    np.log1p(shared_skill)
-    / np.log1p(maximum_shared_skill)
-)
-
-df["_shared_skill_signal"] = (
-    df["_shared_skill_signal"]
-    .replace(
-        [np.inf, -np.inf],
-        0.0
-    )
-    .fillna(0.0)
-    .clip(
-        0.0,
-        1.0
-    )
-)
-
-
-# =====================================================================
-# CHECK NORMALIZED SIGNALS
-# =====================================================================
-
-normalized_columns = [
-    "_semantic_signal",
-    "_skill_signal",
-    "_title_signal",
-    "_category_signal",
-    "_job_coverage_signal",
-    "_resume_coverage_signal",
-    "_jaccard_signal",
-    "_containment_signal",
-    "_overlap_signal",
-    "_shared_skill_signal",
-]
+normalized_columns = list(signal_map.values())
 
 missing_normalized = int(
     df[normalized_columns]
@@ -591,6 +518,22 @@ if missing_normalized > 0:
         f"{missing_normalized}"
     )
 
+if "category_available" in df.columns:
+    category_known = (
+        pd.to_numeric(df["category_available"], errors="coerce")
+        .fillna(0)
+        .astype(bool)
+    )
+else:
+    category_known = pd.Series(
+        "category_match_signal" in df.columns,
+        index=df.index,
+    )
+    print(
+        "NOTE: Step 9 output has no category_available column "
+        "(older Step 9 run); treating every category as known."
+    )
+
 print(
     f"Normalized signals: "
     f"{len(normalized_columns)}"
@@ -601,76 +544,63 @@ print(
     f"{missing_normalized}"
 )
 
+print(
+    f"Pairs with a known category on both sides: "
+    f"{int(category_known.sum()):,} of {len(df):,}"
+)
+
 
 # =====================================================================
 # CALCULATE HYBRID SCORE
 # =====================================================================
 
 print_header(
-    "Calculating transparent hybrid relevance score"
+    "Scoring resume-job pairs"
 )
 
+scorer = mc.MatchScorer.load()
+
 #
-# This is intentionally NOT machine learning.
+# The transparent formula is always computed so it can be audited and
+# compared with the trained model.
 #
-# No training data.
-# No target.
-# No pseudo-label.
-# No evidence-score leakage.
-#
-df["hybrid_match_score"] = (
+df["formula_match_score"] = mc.formula_score(df)
 
-    WEIGHTS["semantic_similarity"]
-    * df["_semantic_signal"]
+score_result = scorer.score(df)
 
-    + WEIGHTS["skill_match_signal"]
-    * df["_skill_signal"]
-
-    + WEIGHTS["title_similarity"]
-    * df["_title_signal"]
-
-    + WEIGHTS["category_match_signal"]
-    * df["_category_signal"]
-
-    + WEIGHTS["job_skill_coverage"]
-    * df["_job_coverage_signal"]
-
-    + WEIGHTS["resume_skill_coverage"]
-    * df["_resume_coverage_signal"]
-
-    + WEIGHTS["jaccard_similarity"]
-    * df["_jaccard_signal"]
-
-    + WEIGHTS["text_containment"]
-    * df["_containment_signal"]
-
-    + WEIGHTS["maximum_skill_overlap_ratio"]
-    * df["_overlap_signal"]
-
-    + WEIGHTS["shared_skill_count_signal"]
-    * df["_shared_skill_signal"]
+df["hybrid_match_score"] = np.clip(
+    score_result.scores,
+    0.0,
+    1.0
 )
 
-df["hybrid_match_score"] = (
-    df["hybrid_match_score"]
-    .clip(
-        0.0,
-        1.0
+df["scoring_method"] = score_result.method
+
+print(
+    f"Scoring method: {score_result.method}"
+)
+
+print(
+    f"Scorer: {scorer.description}"
+)
+
+if scorer.uses_model:
+
+    print(
+        f"Model file: {scorer.model_path}"
     )
-)
 
-print(
-    "Scoring method: "
-    "explicit weighted hybrid aggregation"
-)
+    print(
+        "Training target: "
+        f"{scorer.metadata.get('target', 'unknown')}"
+    )
 
-print(
-    "Supervised model: NONE"
-)
+else:
 
-print(
-    "Training target: NONE"
-)
+    print(
+        "No trained model in use "
+        "(run 10b_train_match_model.py to create one)."
+    )
 
 print(
     "Pseudo-label target: NONE"
@@ -705,10 +635,20 @@ print_header(
     "Generating resume-wise job rankings"
 )
 
+#
+# Tie-break with the formula as it runs online (no category term), so a
+# trained model that gives many pairs the same score still yields the
+# same ordering the app would show.
+#
+df["_tiebreak_formula"] = mc.formula_score(
+    df[list(mc.MODEL_FEATURES)]
+)
+
 df = df.sort_values(
     by=[
         "resume_id",
         "hybrid_match_score",
+        "_tiebreak_formula",
         "semantic_similarity",
         "title_similarity",
         "skill_match_signal",
@@ -716,6 +656,7 @@ df = df.sort_values(
     ],
     ascending=[
         True,
+        False,
         False,
         False,
         False,
@@ -849,7 +790,7 @@ for k in TOP_K_VALUES:
 # =====================================================================
 
 print_header(
-    "Comparing hybrid score with Step 9 evidence_score"
+    "Comparing scores with Step 9 evidence_score"
 )
 
 audit_correlation = float(
@@ -883,6 +824,19 @@ audit_rmse = float(
     )
 )
 
+formula_gap = float(
+    np.max(
+        np.abs(
+            df["formula_match_score"]
+            - df["evidence_score"]
+        )
+    )
+)
+
+step9_uses_same_formula = bool(
+    formula_gap < 1e-6
+)
+
 print(
     f"Correlation with Step 9 evidence_score: "
     f"{audit_correlation:.4f}"
@@ -897,6 +851,25 @@ print(
     f"RMSE difference: "
     f"{audit_rmse:.4f}"
 )
+
+print(
+    f"Max |formula_match_score - Step 9 evidence_score|: "
+    f"{formula_gap:.6f}"
+)
+
+if step9_uses_same_formula:
+
+    print(
+        "Step 9 and Step 10 use the same formula: YES"
+    )
+
+else:
+
+    print(
+        "WARNING: Step 9 evidence_score does not equal the shared "
+        "formula. The Step 9 CSV was probably produced by an older "
+        "version of Step 9 with different weights - re-run Step 9."
+    )
 
 print("""
 This is an AUDIT comparison only.
@@ -917,20 +890,10 @@ print_header(
     "Calculating signal contribution summary"
 )
 
-signal_map = {
-    "semantic_similarity": "_semantic_signal",
-    "skill_match_signal": "_skill_signal",
-    "title_similarity": "_title_signal",
-    "category_match_signal": "_category_signal",
-    "job_skill_coverage": "_job_coverage_signal",
-    "resume_skill_coverage": "_resume_coverage_signal",
-    "jaccard_similarity": "_jaccard_signal",
-    "text_containment": "_containment_signal",
-    "maximum_skill_overlap_ratio": "_overlap_signal",
-    "shared_skill_count_signal": "_shared_skill_signal",
-}
-
 signal_contributions = {}
+
+# These are contributions to the transparent FORMULA. When a trained
+# model is the active scorer they describe the formula, not the model.
 
 for name, weight in WEIGHTS.items():
 
@@ -986,6 +949,7 @@ output_columns = [
     "maximum_skill_overlap_ratio",
 
     "category_match_signal",
+    "category_available",
     "text_containment",
     "title_similarity",
     "skill_match_signal",
@@ -993,11 +957,19 @@ output_columns = [
     "evidence_score",
 
     "hybrid_match_score",
+    "formula_match_score",
+    "scoring_method",
     "job_rank",
 
     "top_5",
     "top_10",
     "top_20",
+]
+
+output_columns = [
+    column
+    for column in output_columns
+    if column in df.columns
 ]
 
 predictions = df[
@@ -1103,6 +1075,36 @@ report = {
     "step_name":
         "Final Hybrid Matching and Ranking",
 
+    "scoring": {
+
+        "source":
+            "matching_core.MatchScorer (shared with steps 13 and 14)",
+
+        "scoring_method":
+            score_result.method,
+
+        "description":
+            scorer.description,
+
+        "trained_model_in_use":
+            bool(scorer.uses_model),
+
+        "model_file":
+            scorer.model_path,
+
+        "fallback_reason":
+            scorer.fallback_reason or None,
+
+        "formula_weights":
+            WEIGHTS,
+
+        "category_weight_redistributed_when_unknown":
+            True,
+
+        "shared_skill_signal_cap":
+            mc.SHARED_SKILL_CAP,
+    },
+
     "input": {
         "path": str(INPUT_PATH),
         "rows": int(len(df)),
@@ -1122,7 +1124,7 @@ report = {
             "Step 9 actual resume text + actual job title and description",
 
         "model":
-            "all-MiniLM-L6-v2",
+            mc.SEMANTIC_MODEL_NAME,
 
         "raw_semantic_text_required":
             False,
@@ -1168,6 +1170,12 @@ report = {
         "modified":
             False,
 
+        "equals_shared_formula":
+            step9_uses_same_formula,
+
+        "max_abs_gap_to_formula":
+            formula_gap,
+
         "mean":
             float(
                 df["evidence_score"].mean()
@@ -1192,13 +1200,38 @@ report = {
     "model": {
 
         "supervised_model":
+            bool(scorer.uses_model),
+
+        "trained_in_this_step":
             False,
 
         "estimator":
-            None,
+            (
+                type(scorer.estimator).__name__
+                if scorer.uses_model
+                else None
+            ),
 
         "training_target":
-            None,
+            (
+                scorer.metadata.get("target")
+                if scorer.uses_model
+                else None
+            ),
+
+        "model_features":
+            (
+                list(scorer.feature_names)
+                if scorer.uses_model
+                else None
+            ),
+
+        "model_trained_at":
+            (
+                scorer.metadata.get("trained_at")
+                if scorer.uses_model
+                else None
+            ),
 
         "pseudo_labels":
             False,
@@ -1213,7 +1246,16 @@ report = {
     "hybrid_scoring": {
 
         "method":
-            "explicit weighted signal aggregation",
+            (
+                "trained model prediction"
+                if scorer.uses_model
+                else "explicit weighted signal aggregation"
+            ),
+
+        "formula_mean_score":
+            float(
+                df["formula_match_score"].mean()
+            ),
 
         "weights":
             WEIGHTS,
@@ -1248,7 +1290,9 @@ report = {
             "resume",
 
         "ranking_direction":
-            "descending hybrid_match_score",
+            "descending hybrid_match_score "
+            "(ties: online formula score, semantic, title, skill signal, "
+            "job_id)",
 
         "top_k_statistics":
             top_k_statistics,
@@ -1354,7 +1398,15 @@ print(
 )
 
 print(
-    "Semantic model: all-MiniLM-L6-v2"
+    f"Semantic model: {mc.SEMANTIC_MODEL_NAME}"
+)
+
+print(
+    f"Scoring method: {score_result.method}"
+)
+
+print(
+    f"Scorer: {scorer.description}"
 )
 
 print(
@@ -1386,7 +1438,12 @@ print(
 )
 
 print(
-    "Supervised ML model trained: NO"
+    "Model trained in this step: NO"
+)
+
+print(
+    "Trained model used for scoring: "
+    + ("YES" if scorer.uses_model else "NO (formula)")
 )
 
 print(

@@ -25,6 +25,12 @@ reports/
 
 Design principles
 -----------------
+- The vocabulary, tokenizer and matcher come from esco_vocab.py, the same
+  module used by Step 13 and the Streamlit app, so a skill means the same
+  thing offline and online
+- Only the ESCO skills table is used (preferredLabel + altLabels of
+  KnowledgeSkillCompetence rows); occupations, skill groups and relation
+  tables are never treated as skills
 - No hardcoded absolute paths
 - Automatically detects normalized/original column names
 - Preserves ESCO identifiers and human-readable labels
@@ -34,13 +40,10 @@ Design principles
 
 from __future__ import annotations
 
-import ast
 import json
 import logging
-import re
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
@@ -80,462 +83,25 @@ REPORT_OUTPUT = REPORTS_DIR / "skill_extraction_report.json"
 
 
 # ============================================================================
-# GENERAL UTILITIES
+# SHARED SKILL VOCABULARY
 # ============================================================================
-
-def normalize_column_name(name: Any) -> str:
-    """
-    Normalize a column name so that different naming conventions match.
-
-    Examples:
-        conceptUri      -> concepturi
-        concept_uri     -> concepturi
-        Concept URI     -> concepturi
-        preferredLabel  -> preferredlabel
-        preferred_label -> preferredlabel
-    """
-    return re.sub(r"[^a-z0-9]", "", str(name).strip().lower())
-
-
-def build_column_map(df: pd.DataFrame) -> Dict[str, str]:
-    """
-    Map normalized column names to actual dataframe column names.
-    """
-    mapping = {}
-
-    for column in df.columns:
-        normalized = normalize_column_name(column)
-
-        if normalized not in mapping:
-            mapping[normalized] = column
-
-    return mapping
-
-
-def find_column(
-    df: pd.DataFrame,
-    candidates: List[str],
-    required: bool = True
-) -> str | None:
-    """
-    Find a dataframe column using normalized candidate names.
-    """
-
-    column_map = build_column_map(df)
-
-    for candidate in candidates:
-        normalized = normalize_column_name(candidate)
-
-        if normalized in column_map:
-            return column_map[normalized]
-
-    if required:
-        raise ValueError(
-            f"Could not find required column.\n"
-            f"Candidates: {candidates}\n"
-            f"Available columns: {list(df.columns)}"
-        )
-
-    return None
-
-
-def clean_text(value: Any) -> str:
-    """
-    Convert a value into clean searchable text.
-    """
-    if value is None:
-        return ""
-
-    if pd.isna(value):
-        return ""
-
-    text = str(value)
-
-    text = text.replace("\r", " ")
-    text = text.replace("\n", " ")
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def normalize_text(text: str) -> str:
-    """
-    Normalize text for matching.
-
-    Human-readable source columns remain untouched in the saved data.
-    This normalized version is used only for matching.
-    """
-
-    text = text.lower()
-
-    # Normalize common separators to spaces.
-    text = re.sub(r"[/_|\\\-]+", " ", text)
-
-    # Keep letters, numbers and spaces.
-    text = re.sub(r"[^a-z0-9+#. ]+", " ", text)
-
-    # Normalize whitespace.
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def tokenize(text: str) -> List[str]:
-    """
-    Tokenize normalized text.
-
-    Keeps:
-        c++
-        c#
-        .net
-        node.js
-        python
-        sql
-    """
-
-    text = normalize_text(text)
-
-    if not text:
-        return []
-
-    return text.split()
-
-
-# ============================================================================
-# SKILL TRIE
-# ============================================================================
-
-class SkillTrieNode:
-    """
-    Node in a token-based trie.
-    """
-
-    __slots__ = ("children", "skill_ids")
-
-    def __init__(self):
-        self.children: Dict[str, SkillTrieNode] = {}
-        self.skill_ids: List[int] = []
-
-
-class SkillTrie:
-    """
-    Efficient multi-word skill matcher.
-
-    Instead of creating tens of thousands of regular expressions,
-    skills are stored as token sequences.
-
-    Example:
-
-        "machine learning"
-
-    becomes:
-
-        machine -> learning
-
-    The resume is then scanned token-by-token.
-    """
-
-    def __init__(self):
-        self.root = SkillTrieNode()
-
-    def add(
-        self,
-        tokens: List[str],
-        skill_id: int
-    ) -> None:
-
-        if not tokens:
-            return
-
-        node = self.root
-
-        for token in tokens:
-
-            if token not in node.children:
-                node.children[token] = SkillTrieNode()
-
-            node = node.children[token]
-
-        if skill_id not in node.skill_ids:
-            node.skill_ids.append(skill_id)
-
-    def find(
-        self,
-        tokens: List[str]
-    ) -> List[int]:
-
-        matches = []
-
-        token_count = len(tokens)
-
-        for start in range(token_count):
-
-            node = self.root
-            position = start
-
-            while position < token_count:
-
-                token = tokens[position]
-
-                if token not in node.children:
-                    break
-
-                node = node.children[token]
-
-                if node.skill_ids:
-                    matches.extend(node.skill_ids)
-
-                position += 1
-
-        return matches
-
-
-# ============================================================================
-# ESCO VOCABULARY
-# ============================================================================
-
-class ESCOVocabulary:
-
-    def __init__(self):
-        self.skills: List[Dict[str, Any]] = []
-        self.trie = SkillTrie()
-
-        self.term_count = 0
-        self.skill_count = 0
-
-    def build_from_dataframe(
-        self,
-        esco_df: pd.DataFrame
-    ) -> None:
-
-        logger.info("=" * 70)
-        logger.info("Loading ESCO skill vocabulary")
-        logger.info("=" * 70)
-
-        logger.info(
-            "ESCO skills shape: %s rows × %s columns",
-            esco_df.shape[0],
-            esco_df.shape[1]
-        )
-
-        # ------------------------------------------------------------
-        # Automatically detect columns
-        # ------------------------------------------------------------
-
-        uri_column = find_column(
-            esco_df,
-            [
-                "conceptUri",
-                "concept_uri",
-                "uri",
-                "skillUri",
-                "skill_uri"
-            ]
-        )
-
-        label_column = find_column(
-            esco_df,
-            [
-                "preferredLabel",
-                "preferred_label",
-                "skillLabel",
-                "skill_label",
-                "label",
-                "name"
-            ]
-        )
-
-        alt_column = find_column(
-            esco_df,
-            [
-                "altLabels",
-                "alt_labels",
-                "alternativeLabels",
-                "alternative_labels"
-            ],
-            required=False
-        )
-
-        description_column = find_column(
-            esco_df,
-            [
-                "description"
-            ],
-            required=False
-        )
-
-        logger.info("Detected ESCO URI column: %s", uri_column)
-        logger.info("Detected ESCO label column: %s", label_column)
-
-        if alt_column:
-            logger.info("Detected alternative labels column: %s", alt_column)
-
-        # ------------------------------------------------------------
-        # Build vocabulary
-        # ------------------------------------------------------------
-
-        seen_terms = set()
-
-        for _, row in esco_df.iterrows():
-
-            uri = clean_text(row.get(uri_column, ""))
-            label = clean_text(row.get(label_column, ""))
-
-            if not label:
-                continue
-
-            skill_id = len(self.skills)
-
-            description = ""
-
-            if description_column:
-                description = clean_text(
-                    row.get(description_column, "")
-                )
-
-            skill_record = {
-                "skill_id": skill_id,
-                "concept_uri": uri,
-                "preferred_label": label,
-                "description": description
-            }
-
-            self.skills.append(skill_record)
-
-            # --------------------------------------------------------
-            # Preferred label
-            # --------------------------------------------------------
-
-            label_tokens = tokenize(label)
-
-            if label_tokens:
-
-                key = " ".join(label_tokens)
-
-                if key not in seen_terms:
-
-                    self.trie.add(
-                        label_tokens,
-                        skill_id
-                    )
-
-                    seen_terms.add(key)
-
-            # --------------------------------------------------------
-            # Alternative labels
-            # --------------------------------------------------------
-
-            if alt_column:
-
-                alt_value = row.get(alt_column)
-
-                if alt_value is not None and not pd.isna(alt_value):
-
-                    alt_text = str(alt_value)
-
-                    # ESCO commonly separates alternatives by newline.
-                    alternatives = re.split(
-                        r"[\n\r|;]+",
-                        alt_text
-                    )
-
-                    for alternative in alternatives:
-
-                        alternative = clean_text(
-                            alternative
-                        )
-
-                        if not alternative:
-                            continue
-
-                        alt_tokens = tokenize(
-                            alternative
-                        )
-
-                        if not alt_tokens:
-                            continue
-
-                        key = " ".join(alt_tokens)
-
-                        if key in seen_terms:
-                            continue
-
-                        self.trie.add(
-                            alt_tokens,
-                            skill_id
-                        )
-
-                        seen_terms.add(key)
-
-        self.skill_count = len(self.skills)
-        self.term_count = len(seen_terms)
-
-        logger.info(
-            "Unique ESCO skills: %s",
-            self.skill_count
-        )
-
-        logger.info(
-            "Unique matching terms: %s",
-            self.term_count
-        )
-
-
-# ============================================================================
-# SKILL EXTRACTION
-# ============================================================================
-
-def deduplicate_skill_ids(
-    skill_ids: List[int]
-) -> List[int]:
-
-    seen = set()
-    result = []
-
-    for skill_id in skill_ids:
-
-        if skill_id not in seen:
-
-            seen.add(skill_id)
-            result.append(skill_id)
-
-    return result
-
-
-def extract_skills_from_text(
-    text: str,
-    vocabulary: ESCOVocabulary
-) -> List[Dict[str, Any]]:
-
-    tokens = tokenize(text)
-
-    if not tokens:
-        return []
-
-    skill_ids = vocabulary.trie.find(tokens)
-
-    skill_ids = deduplicate_skill_ids(
-        skill_ids
-    )
-
-    results = []
-
-    for skill_id in skill_ids:
-
-        skill = vocabulary.skills[skill_id]
-
-        results.append({
-            "skill_id": skill_id,
-            "concept_uri": skill["concept_uri"],
-            "preferred_label": skill["preferred_label"]
-        })
-
-    # Human-readable ordering.
-    results.sort(
-        key=lambda x: x["preferred_label"].lower()
-    )
-
-    return results
+#
+# The skill vocabulary, tokenizer and phrase matcher live in
+# esco_vocab.py so that this offline step, Step 13 and the Streamlit app
+# all agree on what a skill is and how it is found in text. Only the ESCO
+# skills table (preferredLabel + altLabels of KnowledgeSkillCompetence
+# rows) is used - never occupations, skill groups or other ESCO tables.
+
+from esco_vocab import (  # noqa: E402
+    ESCOVocabulary,
+    clean_text,
+    extract_skills_from_text,
+    find_column,
+    load_esco_vocabulary,
+    normalize_column_name,
+    normalize_text,
+    tokenize,
+)
 
 
 # ============================================================================
@@ -949,8 +515,14 @@ def save_report(
         },
 
         "vocabulary": {
+            "source_file": vocabulary.source,
+            "row_filter": vocabulary.row_filter,
+            "non_skill_rows_ignored": vocabulary.dropped_rows,
             "esco_skill_count": vocabulary.skill_count,
-            "matching_term_count": vocabulary.term_count
+            "matching_term_count": vocabulary.term_count,
+            "single_character_terms_skipped": (
+                vocabulary.skipped_short_terms
+            )
         },
 
         "resumes": resume_stats,
@@ -960,8 +532,12 @@ def save_report(
         "method": {
             "matching": "token_based_trie",
             "case_sensitive": False,
+            "vocabulary_module": "esco_vocab.py (shared with steps 13 and 14)",
+            "skills_table_only": True,
             "uses_preferred_labels": True,
             "uses_alternative_labels": True,
+            "uses_hidden_labels": False,
+            "uses_descriptions": False,
             "embeddings": False,
             "llm": False,
             "rag": False
@@ -1032,15 +608,9 @@ def main():
     # Load ESCO
     # ------------------------------------------------------------
 
-    esco_df = pd.read_csv(
-        ESCO_SKILLS_INPUT,
-        low_memory=False
-    )
-
-    vocabulary = ESCOVocabulary()
-
-    vocabulary.build_from_dataframe(
-        esco_df
+    # Skills table only (preferredLabel + altLabels of skill rows).
+    vocabulary = load_esco_vocabulary(
+        ESCO_SKILLS_INPUT
     )
 
     # ------------------------------------------------------------

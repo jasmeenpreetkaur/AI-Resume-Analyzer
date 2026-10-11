@@ -45,6 +45,16 @@ What the app adds on top of job_ranker (presentation only, never score):
     never as a bare 100% from a single detected skill;
   * every skill shown can be traced back to the phrase that triggered it.
 
+LIVE JOB SEARCH (optional)
+--------------------------
+"Live job search" fetches CURRENT postings (live_jobs.py: Adzuna with a free
+key in .env, and Remotive for remote jobs) instead of the 1,167-posting
+offline dataset, which only covers five job categories. The search phrases
+are the job title the user typed plus the ESCO occupations the resume
+resembles (occupation_inference.py). Live postings are scored by the SAME
+matching_core.MatchScorer as offline ones. If live search fails, the app
+says why and falls back to the offline dataset.
+
 Run (from the project root):
     python -m streamlit run src/14_app.py
 ======================================================================
@@ -58,6 +68,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -74,8 +85,11 @@ from sentence_transformers import SentenceTransformer
 
 import esco_vocab
 import job_ranker
+import live_jobs
 import matching_core as mc
+import occupation_inference
 import pdf_text
+import resume_intelligence
 
 
 # ======================================================================
@@ -111,11 +125,31 @@ GROQ_MODEL = os.getenv(
 
 DEFAULT_TOP_K = 5
 
+# --- Job source -----------------------------------------------------------
+
+SOURCE_LIVE = "Live job search"
+SOURCE_OFFLINE = "Offline dataset"
+
+# Live pools get their OWN cache folder: job_ranker's cache files have fixed
+# names, so sharing the offline folder would overwrite the offline cache.
+LIVE_CORPUS_CACHE = CACHE_DIR / "live_corpus"
+
+# Re-running with identical inputs reuses the result for this long, then
+# fetches fresh postings.
+LIVE_ANALYSIS_BUCKET_SECONDS = 900
+
+SUGGESTED_ROLES_SHOWN = 5
+SUGGESTED_ROLE_QUERIES = 3
+
+# Share-of-postings "common skill" rule needs a big pool to mean anything.
+MIN_POOL_FOR_FREQUENCY_FILTER = 300
+
 # --- Display-only skill evidence rules (they never change the score) ---
 
-# A skill found in more than this share of ALL postings (for example
-# "communication") says little about fit, so it is shown but is not
-# counted toward the displayed coverage or listed as a gap.
+# "Common" skills are shown but are not counted toward the displayed
+# coverage or listed as gaps. A skill is common when ESCO classes it as
+# transversal (communication, teamwork, ...), or - only in large pools such as
+# the offline dataset - when it appears in more than this share of postings.
 GENERIC_SKILL_MAX_JOB_SHARE = 0.20
 
 # Fewer specific skills than this means the posting gave thin evidence.
@@ -316,16 +350,227 @@ def load_corpus(jobs_signature: str, vocab_signature: str):
 
 
 # ======================================================================
+# LIVE JOB POOL
+# ======================================================================
+
+def make_encoder(model, batch_size: int = 32):
+    def encode(texts: list[str]) -> np.ndarray:
+        return model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+
+    return encode
+
+
+def occupation_files_signature() -> str:
+    names = (occupation_inference.OCCUPATIONS_FILE, occupation_inference.RELATIONS_FILE)
+
+    return "|".join(
+        get_file_signature(occupation_inference.DATA_DIR / name) for name in names
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def load_occupation_index(signature: str):
+    """(OccupationIndex | None, error message). Embeddings are cached on disk."""
+    del signature
+
+    model = load_semantic_model()
+
+    try:
+        return (
+            occupation_inference.build_occupation_index(
+                make_encoder(model, 64), model_name=MODEL_NAME
+            ),
+            "",
+        )
+    except (occupation_inference.OccupationDataError, OSError, ValueError) as exc:
+        return None, str(exc)
+
+
+def suggested_role_rows(
+    inferred: pd.DataFrame,
+    vocabulary: esco_vocab.ESCOVocabulary | None,
+) -> list[dict[str, str]]:
+
+    def label(uri: str) -> str:
+        return vocabulary.label_for(uri) if vocabulary else uri.rsplit("/", 1)[-1]
+
+    rows = []
+
+    for _, found in inferred.iterrows():
+
+        total = int(found["essential_total"])
+
+        rows.append(
+            {
+                "Role (ESCO occupation)": found["occupation"],
+                "Essential skills evidenced": (
+                    f"{int(found['essential_matched'])} of {total}" if total else "n/a"
+                ),
+                "Evidence in your resume": ", ".join(
+                    label(uri) for uri in found["matched_essential_uris"][:5]
+                ),
+            }
+        )
+
+    return rows
+
+
+def prepare_live_corpus(
+    preferences: dict,
+    resume_embedding: np.ndarray,
+    resume_skill_map: dict[str, str],
+    vocabulary: esco_vocab.ESCOVocabulary | None,
+    model,
+):
+    """
+    Live postings for this resume as a ``JobCorpus``.
+
+    Returns ``(corpus | None, info)``. ``corpus`` is None when live search
+    could not be used; ``info["error"]`` then says why (safe to show).
+    """
+    info: dict[str, Any] = {
+        "notes": [],
+        "providers": [],
+        "queries": [],
+        "suggested": [],
+        "error": "",
+    }
+
+    queries: list[str] = []
+
+    target = (preferences.get("target_title") or "").strip()
+
+    if target:
+        queries.append(target)
+
+    index, index_error = load_occupation_index(occupation_files_signature())
+
+    if index is not None:
+
+        inferred = occupation_inference.infer_occupations(
+            index,
+            resume_embedding,
+            list(resume_skill_map),
+            top_k=SUGGESTED_ROLES_SHOWN,
+        )
+
+        info["suggested"] = suggested_role_rows(inferred, vocabulary)
+
+        queries += occupation_inference.suggest_queries(
+            inferred, SUGGESTED_ROLE_QUERIES
+        )
+
+    else:
+
+        info["notes"].append(
+            f"Role suggestions from your resume are unavailable ({index_error})."
+        )
+
+    info["queries"] = live_jobs.clean_queries(queries)
+
+    try:
+
+        result = live_jobs.fetch_live_jobs(
+            queries,
+            providers=preferences.get("providers") or None,
+            country=preferences.get("country", "in"),
+            where=preferences.get("where", ""),
+        )
+
+    except live_jobs.LiveJobsError as exc:
+
+        info["error"] = str(exc)
+
+        return None, info
+
+    except Exception as exc:  # a live-feed problem must never crash the app
+
+        info["error"] = f"unexpected error ({type(exc).__name__})"
+
+        return None, info
+
+    info["notes"].extend(result.notes)
+    info["providers"] = result.providers_used
+
+    try:
+
+        corpus = job_ranker.build_job_corpus(
+            result.jobs,
+            encode=make_encoder(model),
+            model_name=MODEL_NAME,
+            vocabulary=vocabulary,
+            cache_dir=LIVE_CORPUS_CACHE,
+        )
+
+    except Exception as exc:
+
+        info["error"] = f"could not prepare the live postings ({type(exc).__name__})"
+
+        return None, info
+
+    return corpus, info
+
+
+# ======================================================================
 # SKILL VIEW (display layer on top of job_ranker's skill sets)
 # ======================================================================
 
-def compute_skill_job_share(corpus: job_ranker.JobCorpus) -> dict[str, float]:
-    """Share of all job postings in which each ESCO skill appears."""
-    counts = Counter(
-        uri for skills in corpus.skill_sets for uri in skills
-    )
-    total = max(len(corpus), 1)
-    return {uri: count / total for uri, count in counts.items()}
+@st.cache_resource(show_spinner=False)
+def load_transversal_uris(signature: str) -> frozenset:
+    """URIs of ESCO skills classed as transversal (soft / cross-cutting skills)."""
+    del signature
+
+    path = esco_vocab.find_esco_skills_file()
+
+    if path is None:
+        return frozenset()
+
+    try:
+        frame = pd.read_csv(
+            path,
+            low_memory=False,
+            usecols=lambda column: str(column).lower() in {"concepturi", "reuselevel"},
+        )
+    except (OSError, ValueError):
+        return frozenset()
+
+    columns = {str(c).lower(): c for c in frame.columns}
+
+    if "concepturi" not in columns or "reuselevel" not in columns:
+        return frozenset()
+
+    level = frame[columns["reuselevel"]].astype(str).str.strip().str.lower()
+
+    return frozenset(frame.loc[level == "transversal", columns["concepturi"]].astype(str))
+
+
+def common_skill_uris(
+    corpus: job_ranker.JobCorpus,
+    transversal: frozenset,
+) -> frozenset:
+    """Skills treated as 'common' for display (see GENERIC_SKILL_MAX_JOB_SHARE)."""
+    common = set(transversal)
+
+    if len(corpus) >= MIN_POOL_FOR_FREQUENCY_FILTER:
+
+        counts = Counter(
+            uri for skills in corpus.skill_sets for uri in skills
+        )
+
+        total = len(corpus)
+
+        common |= {
+            uri for uri, count in counts.items()
+            if count / total > GENERIC_SKILL_MAX_JOB_SHARE
+        }
+
+    return frozenset(common)
 
 
 def skill_evidence_level(specific_skill_count: int) -> str:
@@ -340,7 +585,7 @@ def build_skill_view(
     corpus: job_ranker.JobCorpus,
     row_index: int,
     resume_uris: dict[str, str],
-    job_share: dict[str, float],
+    common_uris: frozenset,
 ) -> dict[str, Any]:
     """
     Matched skills, gaps and evidence quality for one job.
@@ -350,10 +595,7 @@ def build_skill_view(
     """
     job_uris = corpus.skill_sets[row_index]
 
-    common = {
-        uri for uri in job_uris
-        if job_share.get(uri, 0.0) > GENERIC_SKILL_MAX_JOB_SHARE
-    }
+    common = {uri for uri in job_uris if uri in common_uris}
     specific = job_uris - common
 
     matched_specific = {uri for uri in specific if uri in resume_uris}
@@ -443,7 +685,7 @@ def build_job_skill_rows(
     corpus: job_ranker.JobCorpus,
     row_index: int,
     resume_uris: dict[str, str],
-    job_share: dict[str, float],
+    common_uris: frozenset,
 ) -> list[dict[str, str]]:
     """One row per ESCO skill found in a posting, with the phrase behind it."""
     vocabulary = corpus.vocabulary
@@ -487,9 +729,7 @@ def build_job_skill_rows(
                 "Skill": corpus.label(uri),
                 "In your resume": "Yes" if uri in resume_uris else "No",
                 "Counts toward coverage": (
-                    "No (common skill)"
-                    if job_share.get(uri, 0.0) > GENERIC_SKILL_MAX_JOB_SHARE
-                    else "Yes"
+                    "No (common skill)" if uri in common_uris else "Yes"
                 ),
                 "Phrase found in posting": (
                     phrase
@@ -888,12 +1128,8 @@ def deterministic_explanation(
     matched_skills: list[str],
     skill_gaps: list[str],
     evidence_level: str = "good",
-    job_skill_count: int = 0,
-    claim_label: str = "experimental_similarity_not_validated",
+    job_skill_count: int = 0
 ):
-    validated = claim_label == "human_validated_relevance"
-    result_phrase = "match" if validated else "similarity result"
-    section_title = "Why this role matches" if validated else "Why this result appears similar"
 
     matched_text = ", ".join(
         matched_skills[:6]
@@ -913,14 +1149,15 @@ def deterministic_explanation(
     else:
 
         why = (
-            f"The text in your resume has some semantic overlap with the "
-            f"{job_title} posting, although few direct skill overlaps were detected."
+            f"The semantic content of your resume has "
+            f"some alignment with the {job_title} role, "
+            f"although few direct skill overlaps were detected."
         )
 
     if evidence_level == "insufficient":
         why += (
             " The posting gave too little specific skill information, "
-            f"so this {result_phrase} mostly reflects text similarity."
+            "so this match mostly reflects text similarity."
         )
     elif evidence_level == "limited":
         why += (
@@ -972,7 +1209,7 @@ def deterministic_explanation(
         )
 
     return (
-        f"**{section_title}**\n"
+        f"**Why this role matches**\n"
         f"{why}\n\n"
         f"**Skills you already have**\n"
         f"{skills}\n\n"
@@ -988,12 +1225,8 @@ def generate_user_friendly_explanation(
     matched_skills: list[str],
     skill_gaps: list[str],
     evidence_level: str = "good",
-    job_skill_count: int = 0,
-    claim_label: str = "experimental_similarity_not_validated",
+    job_skill_count: int = 0
 ):
-    validated = claim_label == "human_validated_relevance"
-    role_header = "Why this role matches" if validated else "Why this result appears similar"
-    result_phrase = "match" if validated else "similarity result"
 
     if client is None:
         return deterministic_explanation(
@@ -1001,8 +1234,7 @@ def generate_user_friendly_explanation(
             matched_skills,
             skill_gaps,
             evidence_level,
-            job_skill_count,
-            claim_label,
+            job_skill_count
         )
 
     matched_text = ", ".join(
@@ -1039,24 +1271,21 @@ Skills found in both resume and job:
 Skills mentioned in the job posting but not detected in the resume:
 {gaps_text}
 
-Claim label: {claim_label}
-
 Rules:
 - Mention ONLY skills that are listed above. Do not infer or invent other skills or abilities.
-- {("You may describe the result as human-judgment-validated relevance, but never as hiring probability." if validated else "Describe this only as experimental text similarity. Do not call the role a match, suitable, or a suitability recommendation.")}
 - Do not write placeholders or parenthetical notes about "other" skills.
 - The resume evidence is keyword detection only. Do not describe proficiency or
   seniority (avoid words like strong, proven, extensive, expert, demonstrates).
 - Do not describe what this kind of role typically requires; refer only to the
   skills listed above. The posting does not say whether a skill is required or optional.
 - If the skill evidence quality is "limited" or "insufficient", say plainly that the posting
-  gave little skill information and the {result_phrase} mostly reflects text similarity.
+  gave little skill information and the match mostly reflects text similarity.
   Never say there are no skill gaps in that case.
 
 Write exactly three short sections:
 
-{role_header}:
-Explain the strongest evidence without overstating it.
+Why this role matches:
+Explain the strongest evidence.
 
 Skills you already have:
 Mention the most relevant matching skills.
@@ -1075,11 +1304,8 @@ Keep the explanation concise and useful to the user.
                 {
                     "role": "system",
                     "content": (
-                        (
-                            "You explain evidence from resume and job text. "
-                            if not validated else "You explain human-judgment-validated resume-job relevance. "
-                        )
-                        + "Always respond in normal human-readable English."
+                        "You explain resume-job matches. "
+                        "Always respond in normal human-readable English."
                     )
                 },
                 {
@@ -1104,8 +1330,7 @@ Keep the explanation concise and useful to the user.
                 matched_skills,
                 skill_gaps,
                 evidence_level,
-                job_skill_count,
-                claim_label,
+                job_skill_count
             )
             + "\n\n"
               "*LLM explanation unavailable; evidence-based "
@@ -1117,8 +1342,7 @@ Keep the explanation concise and useful to the user.
         matched_skills,
         skill_gaps,
         evidence_level,
-        job_skill_count,
-        claim_label,
+        job_skill_count
     )
 
 
@@ -1185,6 +1409,10 @@ def analyze_resume(
 
     resume_text = extraction.text
 
+    # Structured analysis uses the entire extracted resume text; it does not
+    # infer achievements or credentials that are not supported by the document.
+    full_resume_analysis = resume_intelligence.analyze_resume_text(resume_text)
+
     st.success(
         f"Extracted {len(resume_text):,} characters"
         + (
@@ -1237,25 +1465,7 @@ def analyze_resume(
     )
 
     # --------------------------------------------------------------
-    # 3. JOB CORPUS (embeddings + skill sets; cached on disk)
-    # --------------------------------------------------------------
-
-    st.write(
-        "📊 Preparing job postings (the first run builds caches "
-        "and can take a few minutes)..."
-    )
-
-    corpus = load_corpus(
-        get_file_signature(JOB_DATA_PATH),
-        vocabulary_signature()
-    )
-
-    st.success(
-        f"Loaded {len(corpus):,} job postings"
-    )
-
-    # --------------------------------------------------------------
-    # 4. RESUME SKILLS (ESCO skills table only)
+    # 3. RESUME SKILLS (ESCO skills table only)
     # --------------------------------------------------------------
 
     st.write(
@@ -1272,7 +1482,7 @@ def analyze_resume(
     )
 
     # --------------------------------------------------------------
-    # 5. RESUME EMBEDDING
+    # 4. RESUME EMBEDDING
     # --------------------------------------------------------------
 
     st.write(
@@ -1286,6 +1496,69 @@ def analyze_resume(
     )[0].astype(np.float32)
 
     # --------------------------------------------------------------
+    # 5. JOB POOL: live postings, or the offline dataset
+    # --------------------------------------------------------------
+
+    pool_notes: list[str] = []
+    live_info: dict[str, Any] = {}
+    corpus = None
+    job_source = "offline"
+
+    if preferences.get("source") == SOURCE_LIVE:
+
+        st.write(
+            "🌐 Searching live job postings (inferring roles from your resume)..."
+        )
+
+        corpus, live_info = prepare_live_corpus(
+            preferences,
+            resume_embedding,
+            resume_skill_map,
+            vocabulary,
+            model
+        )
+
+        if corpus is not None:
+
+            job_source = "live"
+
+            st.success(
+                f"Fetched {len(corpus):,} live postings from "
+                f"{', '.join(live_info['providers'])}"
+            )
+
+            pool_notes.extend(live_info["notes"])
+
+        else:
+
+            st.warning(
+                "Live job search could not be used: "
+                + live_info.get("error", "unknown problem")
+            )
+
+            pool_notes.append(
+                "Live job search was unavailable ("
+                + live_info.get("error", "unknown problem")
+                + "), so these results come from the offline dataset instead."
+            )
+
+    if corpus is None:
+
+        st.write(
+            "📊 Preparing offline job postings (the first run builds "
+            "caches and can take a few minutes)..."
+        )
+
+        corpus = load_corpus(
+            get_file_signature(JOB_DATA_PATH),
+            vocabulary_signature()
+        )
+
+        st.success(
+            f"Loaded {len(corpus):,} job postings"
+        )
+
+    # --------------------------------------------------------------
     # 6. SCORE EVERY JOB (matching_core.MatchScorer)
     # --------------------------------------------------------------
 
@@ -1293,7 +1566,7 @@ def analyze_resume(
         "📈 Scoring and ranking jobs..."
     )
 
-    ranked = job_ranker.rank_resume(
+    ranked = job_ranker.rank_jobs(
         corpus,
         resume_text=resume_text,
         resume_embedding=resume_embedding,
@@ -1311,6 +1584,8 @@ def analyze_resume(
         preferences.get("experience", "No preference"),
         top_k,
     )
+
+    scope_notes = pool_notes + scope_notes
 
     ranked = ranked[
         ranked["row_index"].isin(np.flatnonzero(scope_mask))
@@ -1362,7 +1637,10 @@ def analyze_resume(
     # --------------------------------------------------------------
 
     columns = corpus.columns
-    job_share = compute_skill_job_share(corpus)
+    common_uris = common_skill_uris(
+        corpus,
+        load_transversal_uris(vocabulary_signature())
+    )
 
     companies = []
     locations = []
@@ -1395,7 +1673,7 @@ def analyze_resume(
                 corpus,
                 row_index,
                 resume_skill_map,
-                job_share
+                common_uris
             )
         )
 
@@ -1404,7 +1682,7 @@ def analyze_resume(
                 corpus,
                 row_index,
                 resume_skill_map,
-                job_share
+                common_uris
             )
         )
 
@@ -1412,6 +1690,21 @@ def analyze_resume(
     top["location"] = locations
     top["description"] = descriptions
     top["skill_trace_rows"] = trace_rows
+
+    # Live-posting details (empty for the offline dataset).
+    for column, default in (
+        ("url", ""),
+        ("source", ""),
+        ("posted", ""),
+        ("description_truncated", False),
+        ("salary", ""),
+    ):
+        top[column] = [
+            corpus.frame.iloc[int(position)][column]
+            if column in corpus.frame.columns
+            else default
+            for position in top["row_index"]
+        ]
 
     for key in (
         "matched_skills",
@@ -1453,8 +1746,7 @@ def analyze_resume(
                 row["matched_skills"],
                 row["skill_gaps"],
                 row["evidence_level"],
-                int(row["specific_skill_count"]),
-                scorer.claim_label,
+                int(row["specific_skill_count"])
             )
         )
 
@@ -1468,6 +1760,7 @@ def analyze_resume(
 
     return {
         "resume_text": resume_text,
+        "full_resume_analysis": full_resume_analysis,
         "extraction": extraction.to_record(),
         "resume_skills": sorted(
             resume_skill_map.values(),
@@ -1481,20 +1774,122 @@ def analyze_resume(
         "skill_matching_enabled": vocabulary is not None,
         "scoring_method": scorer.method,
         "scoring_description": scorer.description,
-        "claim_label": scorer.claim_label,
-        "claim_description": scorer.claim_description,
-        "claim": scorer.claim.to_dict(),
-        "suitability_wording_allowed": scorer.suitability_wording_allowed,
-        "scorer_fingerprint": scorer.scorer_fingerprint,
-        "candidate_policy": "semantic_top_k_union_lexical_top_k_union_esco_skill_top_k",
-        "candidate_policy_fingerprint": job_ranker.candidate_retrieval.DEFAULT_POLICY.fingerprint,
-        "candidates_scored": int(len(ranked)),
         "all_recommendations": ranked,
         "top_recommendations": top,
         "total_jobs": len(corpus),
         "scope_notes": scope_notes,
         "preferences": preferences,
+        "job_source": job_source,
+        "providers_used": live_info.get("providers", []),
+        "live_queries": live_info.get("queries", []),
+        "suggested_roles": live_info.get("suggested", []),
     }
+
+
+
+def render_full_resume_analysis(profile: dict[str, Any]) -> None:
+    """Render the structured, evidence-backed analysis of the whole resume."""
+    st.markdown(
+        '<div class="section-title">🧾 Full-Resume Intelligence</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Extracted from the full PDF text. Entries are evidence snippets, not verified facts; "
+        "unclear fields stay unknown instead of being guessed."
+    )
+
+    if profile.get("quality_notes"):
+        for note in profile["quality_notes"]:
+            st.info(note)
+
+    status = profile.get("section_status", {})
+    labels = {
+        "summary": "Summary", "skills": "Skills", "projects": "Projects",
+        "experience": "Experience", "internships": "Internships",
+        "education": "Education", "certifications": "Certifications",
+        "achievements": "Achievements", "publications_research": "Research/Publications",
+        "leadership_volunteering": "Leadership/Volunteering", "languages": "Languages",
+    }
+    rows = []
+    for key, label in labels.items():
+        value = status.get(key, "not_detected")
+        display = {
+            "extracted": "Extracted",
+            "heading_found_but_content_empty": "Heading found, no content extracted",
+            "not_detected": "Not detected",
+        }.get(value, value)
+        rows.append({"Resume section": label, "Extraction status": display})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    metrics = st.columns(4)
+    metrics[0].metric("Projects detected", len(profile.get("projects", [])))
+    metrics[1].metric("Experience entries", len(profile.get("experience", [])))
+    metrics[2].metric("Internship entries", len(profile.get("internships", [])))
+    metrics[3].metric("Technologies spotted", len(profile.get("technologies", [])))
+
+    tabs = st.tabs([
+        "Projects", "Experience & Internships", "Education & Certifications",
+        "Skills & Tools", "Other Evidence", "Raw Sections"
+    ])
+    with tabs[0]:
+        projects = profile.get("projects", [])
+        if not projects:
+            st.info("No project entries were confidently segmented from the detected Projects section.")
+        for i, project in enumerate(projects, 1):
+            with st.expander(f"Project evidence {i}: {project.get('name_or_entry', 'Untitled entry')[:100]}"):
+                st.write("**Objective/problem evidence:**", project.get("objective_or_problem") or "Unknown")
+                st.write("**Technologies detected:**", ", ".join(project.get("technologies", [])) or "Not detected")
+                st.write("**Stated contribution evidence:**")
+                st.write("\\n".join(f"- {item}" for item in project.get("stated_contribution", [])) or "Not detected")
+                st.write("**Documented outcomes:**")
+                st.write("\\n".join(f"- {item}" for item in project.get("documented_outcomes", [])) or "No explicit outcome detected")
+                st.write("**Deployment/testing evidence:**")
+                st.write("\\n".join(f"- {item}" for item in project.get("deployment_or_testing_evidence", [])) or "Not detected")
+                st.caption(f"Confidence: {project.get('confidence', 'unknown')}. Source: {project.get('evidence', '')}")
+    with tabs[1]:
+        for heading, key in (("Experience", "experience"), ("Internships / Training", "internships")):
+            st.markdown(f"**{heading}**")
+            entries = profile.get(key, [])
+            if not entries:
+                st.caption("No entries extracted.")
+            for item in entries:
+                st.write(f"- {item.get('entry', '')}")
+                if item.get("dates_detected"):
+                    st.caption("Dates detected: " + ", ".join(item["dates_detected"]))
+                if item.get("technologies"):
+                    st.caption("Technologies: " + ", ".join(item["technologies"]))
+                st.caption("Evidence: " + item.get("evidence", ""))
+    with tabs[2]:
+        for heading, key in (("Education", "education"), ("Certifications", "certifications")):
+            st.markdown(f"**{heading}**")
+            entries = profile.get(key, [])
+            if not entries:
+                st.caption("No entries extracted. This is not proof that the resume contains none.")
+            for item in entries:
+                st.write("- " + item.get("text", ""))
+                st.caption("Evidence: " + item.get("evidence", ""))
+    with tabs[3]:
+        st.write("**Technology/tool mentions across the full resume**")
+        st.write(", ".join(profile.get("technologies", [])) or "No known technology terms detected.")
+        st.write("**Content in the detected Skills section**")
+        entries = profile.get("skills", [])
+        st.write("\\n".join(f"- {item}" for item in entries) or "No Skills section content extracted.")
+    with tabs[4]:
+        for heading, key in (
+            ("Achievements / Awards / Competitions", "achievements"),
+            ("Research / Publications", "publications_research"),
+            ("Leadership / Volunteering", "leadership_volunteering"),
+            ("Languages", "languages"),
+            ("Summary / Objective", "summary"),
+        ):
+            st.markdown(f"**{heading}**")
+            entries = profile.get(key, [])
+            st.write("\\n".join(f"- {item.get('text', '')}" for item in entries) or "Not detected.")
+    with tabs[5]:
+        for key, entries in profile.get("sections", {}).items():
+            if entries:
+                with st.expander(key.replace("_", " ").title()):
+                    st.write("\\n".join(f"- {entry.get('text', '')}" for entry in entries))
 
 
 # ======================================================================
@@ -1532,14 +1927,11 @@ def display_results(
 
     st.caption(
         "Scoring: "
-        + result.get("scoring_description", "unknown")
-    )
-
-    if not result.get("suitability_wording_allowed", False):
-        st.warning(
-            "Experimental similarity scores — not validated against sufficient human relevance judgments. "
-            "These scores are not hiring probabilities and should not be interpreted as proof that a role is suitable."
+        + result.get(
+            "scoring_description",
+            "unknown"
         )
+    )
 
     if result.get("extraction", {}).get("ocr_used"):
 
@@ -1582,7 +1974,7 @@ def display_results(
 
     with c4:
         st.metric(
-            "Top Suitability" if result.get("suitability_wording_allowed", False) else "Top Similarity",
+            "Top Match",
             score_percent(
                 top.iloc[0][
                     "hybrid_match_score"
@@ -1592,10 +1984,12 @@ def display_results(
             else "N/A"
         )
 
+    render_full_resume_analysis(result.get("full_resume_analysis", {}))
+
     if len(top) == 0:
         st.warning(
-            "No postings met the current filters and score threshold. "
-            "Try lowering the threshold or broadening your career interests."
+            "No postings met your preferences and minimum overall match. "
+            "Try lowering the minimum match or broadening your career interests."
         )
         return
 
@@ -1627,6 +2021,33 @@ def display_results(
         )
 
     # --------------------------------------------------------------
+    # ROLES THE RESUME RESEMBLES (live search only)
+    # --------------------------------------------------------------
+
+    if result.get("suggested_roles"):
+
+        st.markdown(
+            '<div class="section-title">🧭 Roles Your Resume Resembles</div>',
+            unsafe_allow_html=True
+        )
+
+        st.dataframe(
+            pd.DataFrame(result["suggested_roles"]),
+            hide_index=True
+        )
+
+        st.caption(
+            "ESCO occupations whose description and essential skills resemble "
+            "your resume. This is a similarity suggestion used to search for "
+            "jobs - not a prediction of suitability or hiring chances."
+            + (
+                " Searched for: " + ", ".join(result["live_queries"]) + "."
+                if result.get("live_queries")
+                else ""
+            )
+        )
+
+    # --------------------------------------------------------------
     # JOBS
     # --------------------------------------------------------------
 
@@ -1635,6 +2056,19 @@ def display_results(
         unsafe_allow_html=True
     )
 
+    if result.get("job_source") == "live":
+
+        credits = [
+            f"[{live_jobs.ATTRIBUTION[name][0]}]({live_jobs.ATTRIBUTION[name][1]})"
+            for name in result.get("providers_used", [])
+            if name in live_jobs.ATTRIBUTION
+        ]
+
+        st.caption(
+            "Live postings - " + " · ".join(credits)
+            + ". Open a posting for its full, current requirements."
+        )
+
     for rank, (_, row) in enumerate(
         top.iterrows(),
         start=1
@@ -1642,8 +2076,7 @@ def display_results(
 
         with st.expander(
             f"#{rank}  {row['job_title']}   "
-            f"• {'Suitability' if result.get('suitability_wording_allowed', False) else 'Similarity'} "
-            f"{score_percent(row['hybrid_match_score'])}",
+            f"• Match {score_percent(row['hybrid_match_score'])}",
             expanded=(rank == 1)
         ):
 
@@ -1652,7 +2085,7 @@ def display_results(
             with c1:
 
                 st.metric(
-                    "Overall Suitability" if result.get("suitability_wording_allowed", False) else "Overall Similarity",
+                    "Overall Match",
                     score_percent(
                         row[
                             "hybrid_match_score"
@@ -1663,7 +2096,7 @@ def display_results(
             with c2:
 
                 st.metric(
-                    "Semantic Similarity",
+                    "Semantic Match",
                     score_percent(
                         row[
                             "semantic_similarity"
@@ -1717,6 +2150,31 @@ def display_results(
                     f"**Location:** {row['location']}"
                 )
 
+            if row["source"]:
+
+                posted = str(row["posted"])[:10]
+
+                st.write(
+                    f"**Source:** {row['source']}"
+                    + (f" · posted {posted}" if posted else "")
+                    + (f" · salary {row['salary']}" if row["salary"] else "")
+                )
+
+            if row["url"]:
+
+                st.link_button(
+                    f"🔗 View posting on {row['source'] or 'the job site'}",
+                    row["url"]
+                )
+
+            if row["description_truncated"]:
+
+                st.caption(
+                    "⚠️ This site provides only a short snippet of the "
+                    "description, so the skills below may be incomplete. "
+                    "Open the posting for the full requirements."
+                )
+
             st.markdown(
                 "### ✅ Skills You Already Have"
             )
@@ -1751,8 +2209,6 @@ def display_results(
 
             st.markdown(
                 "### 💡 Why This Job Matches"
-                if row.get("claim_label") == "human_validated_relevance"
-                else "### 💡 Why This Result Appears Similar"
             )
 
             # LLM text is rendered as Markdown, never as raw HTML.
@@ -1862,6 +2318,40 @@ def display_results(
             )
 
     # --------------------------------------------------------------
+    # EVIDENCE-BASED LEARNING ROADMAP
+    # --------------------------------------------------------------
+
+    st.markdown(
+        '<div class="section-title">🗺️ Prioritized Learning Roadmap</div>',
+        unsafe_allow_html=True
+    )
+
+    if sorted_gaps:
+        st.caption(
+            "Priorities are derived from skills detected in the recommended job descriptions. "
+            "Frequency indicates how many shown postings mention the skill, not a guarantee "
+            "that every employer requires it."
+        )
+        roadmap_rows = []
+        for priority, (gap, titles) in enumerate(sorted_gaps[:10], start=1):
+            roadmap_rows.append({
+                "Priority": priority,
+                "Skill to investigate": gap,
+                "Recommended next step": (
+                    f"Study the fundamentals of {gap}, complete a small role-relevant project, "
+                    "and add it to the resume only after you have evidence of using it."
+                ),
+                "Evidence from job postings": f"Appears in {len(titles)} shown posting(s)",
+                "Related postings": "; ".join(titles[:5]),
+            })
+        st.dataframe(pd.DataFrame(roadmap_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info(
+            "A job-derived learning roadmap cannot be prioritized because the shown postings "
+            "did not provide enough specific skill-gap evidence."
+        )
+
+    # --------------------------------------------------------------
     # EXPORT
     # --------------------------------------------------------------
 
@@ -1927,6 +2417,7 @@ def render_sidebar():
         pipeline = [
             "Resume text extraction (OCR fallback)",
             "ESCO skill vocabulary",
+            "ESCO role inference + live job search",
             "Skill extraction",
             "Semantic embedding",
             "Job similarity",
@@ -2038,6 +2529,18 @@ def render_sidebar():
         st.divider()
 
         st.subheader(
+            "🌐 Live jobs"
+        )
+
+        for name, status in live_jobs.provider_status().items():
+
+            st.write(
+                f"{'✅' if status['available'] else '⚪'} {name}: {status['note']}"
+            )
+
+        st.divider()
+
+        st.subheader(
             "📊 Dataset"
         )
 
@@ -2106,6 +2609,67 @@ def main():
         unsafe_allow_html=True
     )
 
+    live_status = live_jobs.provider_status()
+
+    source = st.radio(
+        "Where should jobs come from?",
+        options=[SOURCE_LIVE, SOURCE_OFFLINE],
+        index=0 if live_status["Adzuna"]["available"] else 1,
+        horizontal=True,
+        help="Live search fetches current postings for any field. The offline "
+             "dataset has 1,167 postings in only five categories."
+    )
+
+    target_title = ""
+    location_text = ""
+    country = "in"
+    chosen_providers: list[str] = []
+
+    if source == SOURCE_LIVE:
+
+        live_col1, live_col2, live_col3 = st.columns(3)
+
+        with live_col1:
+            target_title = st.text_input(
+                "Target job title (optional)",
+                placeholder="e.g. data analyst",
+                help="Used as a search phrase. Roles inferred from your "
+                     "resume are searched too."
+            )
+
+        with live_col2:
+            location_text = st.text_input(
+                "Location (optional)",
+                placeholder="e.g. Delhi",
+                help="Used by Adzuna. Remotive lists remote jobs only."
+            )
+
+        with live_col3:
+            country = st.selectbox(
+                "Country (Adzuna)",
+                options=live_jobs.ADZUNA_COUNTRY_HINTS,
+                index=0
+            )
+
+        available = [
+            name for name, status in live_status.items() if status["available"]
+        ]
+
+        chosen_providers = st.multiselect(
+            "Job sources",
+            options=list(live_status.keys()),
+            default=available,
+            help="Adzuna needs ADZUNA_APP_ID and ADZUNA_APP_KEY in your .env "
+                 "file. Remotive needs no key (remote jobs only)."
+        )
+
+        if not live_status["Adzuna"]["available"]:
+            st.info(
+                "Adzuna is not configured, so only remote jobs (Remotive) "
+                "can be searched. Add a free Adzuna key to .env for jobs "
+                "in every field: " + live_status["Adzuna"]["note"] + "."
+            )
+
     interests = st.multiselect(
         "Which job roles interest you?",
         options=INTEREST_OPTIONS,
@@ -2130,13 +2694,8 @@ def main():
         )
 
     with pref_col3:
-        active_scorer = load_scorer(scorer_signature())
-        threshold_label = (
-            "Minimum suitability score (%)" if active_scorer.suitability_wording_allowed
-            else "Minimum similarity score (%)"
-        )
         min_match_percent = st.slider(
-            threshold_label,
+            "Minimum overall match (%)",
             min_value=0,
             max_value=80,
             value=int(DEFAULT_MIN_MATCH * 100),
@@ -2149,6 +2708,11 @@ def main():
         "interests": interests,
         "experience": experience,
         "min_match": min_match_percent / 100,
+        "source": source,
+        "target_title": target_title.strip(),
+        "where": location_text.strip(),
+        "country": country,
+        "providers": chosen_providers,
     }
 
     analyze = st.button(
@@ -2189,6 +2753,11 @@ def main():
                 "scorer": scorer_signature(),
                 "vocabulary": vocabulary_signature(),
                 "jobs": get_file_signature(JOB_DATA_PATH),
+                "live_bucket": (
+                    int(time.time() // LIVE_ANALYSIS_BUCKET_SECONDS)
+                    if source == SOURCE_LIVE
+                    else 0
+                ),
             },
             sort_keys=True
         )

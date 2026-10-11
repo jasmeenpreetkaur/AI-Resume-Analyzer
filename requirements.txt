@@ -23,12 +23,16 @@ groq>=0.9
 #                  apt install tesseract-ocr  /  brew install tesseract  /
 #                  https://github.com/UB-Mannheim/tesseract/wiki on Windows)
 #   2. PyMuPDF OCR (needs the Tesseract program and its language data)
-#   3. RapidOCR    pip install rapidocr-onnxruntime pillow   (pure pip, no
-#                  separate program; a good choice on Windows)
+#   3. RapidOCR    pip install rapidocr-onnxruntime pillow
+#                  Note: RapidOCR's currently available builds may not support Python 3.14.
 # Force one with RESUME_OCR_ENGINE=tesseract|pymupdf|rapidocr|none
 pytesseract>=0.3.10
 pillow>=10.0
-rapidocr-onnxruntime>=1.3
+# Optional only; do not uncomment on Python 3.14 unless a compatible wheel is available:
+# rapidocr-onnxruntime>=1.3.24,<1.5
+
+# Live job search HTTP requests
+requests>=2.31
 
 # Tests
 pytest>=8.0

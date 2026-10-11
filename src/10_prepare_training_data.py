@@ -959,6 +959,8 @@ output_columns = [
     "hybrid_match_score",
     "formula_match_score",
     "scoring_method",
+    "scorer_fingerprint",
+    "claim_label",
     "job_rank",
 
     "top_5",
@@ -975,6 +977,8 @@ output_columns = [
 predictions = df[
     output_columns
 ].copy()
+predictions["scorer_fingerprint"] = scorer.scorer_fingerprint
+predictions["claim_label"] = scorer.claim_label
 
 print(
     f"Output shape: "
@@ -1085,6 +1089,11 @@ report = {
 
         "description":
             scorer.description,
+
+        "claim_label": scorer.claim_label,
+        "claim_description": scorer.claim_description,
+        "suitability_wording_allowed": scorer.suitability_wording_allowed,
+        "scorer_fingerprint": scorer.scorer_fingerprint,
 
         "trained_model_in_use":
             bool(scorer.uses_model),

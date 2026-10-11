@@ -319,6 +319,20 @@ def test_without_a_vocabulary_ranking_degrades_to_text_signals(jobs, tmp_path):
     assert ranked["job_title"].iloc[0] == "Data Scientist"
 
 
+def test_blank_resume_returns_no_ranked_candidates(jobs, vocabulary, tmp_path):
+    corpus = build(jobs, vocabulary, tmp_path)
+    ranked = jr.rank_jobs(
+        corpus,
+        resume_text="",
+        resume_embedding=np.zeros(DIM, dtype=np.float32),
+        resume_skills=[],
+        scorer=mc.MatchScorer.formula_only(),
+    )
+    assert ranked.empty
+    assert "row_index" in ranked.columns
+    assert "claim_label" in ranked.columns
+
+
 def test_embedding_dimension_mismatch_is_a_clear_error(jobs, vocabulary, tmp_path):
 
     corpus = build(jobs, vocabulary, tmp_path)
@@ -422,3 +436,22 @@ def test_skill_cache_is_invalidated_by_vocabulary_change(jobs, tmp_path):
 
     assert SKILL + "sql" not in first.skill_sets[2]
     assert SKILL + "sql" in second.skill_sets[2]
+
+
+def test_skill_cache_is_invalidated_when_job_skill_cells_change(
+    jobs, vocabulary, tmp_path
+):
+    # Row 4 contains no SQL in its text; only the source skill cell changes.
+    original = jr.build_job_corpus(
+        jobs, encode=fake_encode, model_name="fake",
+        vocabulary=vocabulary, cache_dir=tmp_path,
+    )
+    changed = jobs.copy()
+    changed.loc[3, "job_skill_set"] = "['SQL']"
+    rebuilt = jr.build_job_corpus(
+        changed, encode=fake_encode, model_name="fake",
+        vocabulary=vocabulary, cache_dir=tmp_path,
+    )
+
+    assert SKILL + "sql" not in original.skill_sets[3]
+    assert SKILL + "sql" in rebuilt.skill_sets[3]

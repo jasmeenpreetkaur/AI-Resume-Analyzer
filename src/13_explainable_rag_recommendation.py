@@ -82,7 +82,7 @@ import pdf_text
 from esco_vocab import load_esco_vocabulary
 from job_ranker import (
     build_job_corpus,
-    rank_jobs,
+    rank_resume,
     resume_skill_uris,
     skill_breakdown,
 )
@@ -1021,7 +1021,7 @@ print_header(
     "SCORING AND RANKING JOBS"
 )
 
-ranked = rank_jobs(
+ranked = rank_resume(
     corpus,
     resume_text=resume_text,
     resume_embedding=resume_embedding,
@@ -1502,6 +1502,12 @@ analysis = {
         "scorer":
             scorer.description,
 
+        "claim_label": scorer.claim_label,
+        "claim_description": scorer.claim_description,
+        "suitability_wording_allowed": scorer.suitability_wording_allowed,
+        "scorer_fingerprint": scorer.scorer_fingerprint,
+        "candidate_policy": "semantic_top_k_union_lexical_top_k_union_esco_skill_top_k",
+
         "trained_model_in_use":
             bool(scorer.uses_model),
 
@@ -1570,7 +1576,7 @@ analysis = {
             False,
 
         "manual_annotation_required":
-            False
+            not scorer.suitability_wording_allowed
     },
 
     "outputs": {
@@ -1656,6 +1662,12 @@ report = {
 
         "scorer":
             scorer.description,
+
+        "claim_label": scorer.claim_label,
+        "claim_description": scorer.claim_description,
+        "suitability_wording_allowed": scorer.suitability_wording_allowed,
+        "scorer_fingerprint": scorer.scorer_fingerprint,
+        "candidate_policy": "semantic_top_k_union_lexical_top_k_union_esco_skill_top_k",
 
         "trained_model_in_use":
             bool(scorer.uses_model),
@@ -1820,7 +1832,8 @@ print(
 )
 
 print(
-    "Manual annotation required: NO"
+    "Human relevance validation passed: "
+    + ("YES" if scorer.suitability_wording_allowed else "NO - results remain experimental similarity")
 )
 
 print(

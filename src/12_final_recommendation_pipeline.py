@@ -31,6 +31,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+import matching_core as mc
+
 
 # ======================================================================
 # PATH CONFIGURATION
@@ -468,6 +470,29 @@ if step10[[resume_col, job_col]].duplicated().any():
     raise ValueError(
         "Duplicate resume-job pairs detected in Step 10."
     )
+
+# Step 12 may not consume stale predictions after the active model, scoring
+# code, or candidate-retrieval policy changes. Rerun Step 10 first.
+if "scorer_fingerprint" not in step10.columns:
+    raise ValueError(
+        "Step 10 predictions have no scorer_fingerprint. Rerun "
+        "src/10_prepare_training_data.py with the current code before Step 12."
+    )
+current_scorer = mc.MatchScorer.load()
+step10_fingerprints = {
+    str(value).strip() for value in step10["scorer_fingerprint"].dropna()
+    if str(value).strip()
+}
+if step10_fingerprints != {current_scorer.scorer_fingerprint}:
+    raise RuntimeError(
+        "The active scorer/retrieval code differs from the scorer used by Step 10. "
+        "Rerun src/10_prepare_training_data.py, then rerun Step 12. "
+        f"Step 10 fingerprint(s): {sorted(step10_fingerprints)}; "
+        f"current fingerprint: {current_scorer.scorer_fingerprint}"
+    )
+
+info("Scorer fingerprint: unchanged since Step 10")
+info(f"Suitability wording allowed: {current_scorer.suitability_wording_allowed}")
 
 info(f"Rows: {len(step10):,}")
 info(f"Unique resumes: {step10[resume_col].nunique():,}")
@@ -1249,12 +1274,20 @@ report = {
         "ground_truth_hiring_labels": False,
         "hiring_probability_claimed": False,
         "score_interpretation": (
-            "continuous match score, not probability of hiring"
+            "human-judgment-validated relevance for this scorer version"
+            if current_scorer.suitability_wording_allowed
+            else "experimental similarity score; human relevance not validated; not hiring probability"
         ),
+        "scorer_fingerprint_matches_step10": True,
+        "scorer_fingerprint": current_scorer.scorer_fingerprint,
+        "claim_label": current_scorer.claim_label,
+        "suitability_wording_allowed": current_scorer.suitability_wording_allowed,
     },
 
     "score_presentation": {
-        "display_name": "Match Score",
+        "display_name": (
+            "Suitability Score" if current_scorer.suitability_wording_allowed else "Similarity Score"
+        ),
         "display_scale": "0-100",
         "normalization": "min-max presentation scaling",
         "raw_score_preserved": True,
@@ -1300,6 +1333,8 @@ report = {
         "missing_match_scores": False,
         "ranking_validated": True,
         "top10_flag_validated": True,
+        "scorer_fingerprint_matches_step10": True,
+        "human_relevance_validated": current_scorer.suitability_wording_allowed,
     },
 
     "outputs": {

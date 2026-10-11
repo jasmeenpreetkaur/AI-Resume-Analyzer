@@ -386,9 +386,9 @@ class ESCOVocabulary:
                             normalized_alt
                         ] = tokenize(alternative)
 
-        self.unique_labels = list(
-            self.all_labels.keys()
-        )
+        # Stable label order means equal-scoring ties do not depend on CSV
+        # row-order artefacts or set/dict construction details.
+        self.unique_labels = sorted(self.all_labels.keys())
 
         logger.info(
             f"Unique ESCO skills: {len(self.skills)}"
@@ -409,6 +409,14 @@ class SkillMapper:
     def __init__(self, vocabulary: ESCOVocabulary):
 
         self.vocab = vocabulary
+
+        # Deterministic inverted token index for fuzzy candidates. A set's
+        # iteration order depends on PYTHONHASHSEED; using next(iter(tokens))
+        # made some fuzzy mappings vary between runs.
+        self.labels_by_token: dict[str, set[str]] = defaultdict(set)
+        for label in sorted(self.vocab.unique_labels):
+            for token in self.vocab.label_tokens.get(label, set()):
+                self.labels_by_token[token].add(label)
 
         self.stats = {
             "total": 0,
@@ -595,29 +603,21 @@ class SkillMapper:
         fuzzy_best_uri = None
         fuzzy_best_score = 0.0
 
-        # Use token candidates where possible.
-        candidate_labels = []
+        # Gather candidates from every query token, then order them by
+        # token overlap, fuzzy similarity and label. This is deterministic
+        # across processes and Python hash seeds.
+        candidate_set: set[str] = set()
+        for token in sorted(query_tokens):
+            candidate_set.update(self.labels_by_token.get(token, set()))
 
-        first_token = next(
-            iter(query_tokens),
-            None
-        )
-
-        if first_token:
-
-            for label in self.vocab.unique_labels:
-
-                if first_token in self.vocab.label_tokens.get(
-                    label,
-                    set()
-                ):
-
-                    candidate_labels.append(label)
-
-        # If no useful candidates exist, don't scan everything.
-        candidate_labels = candidate_labels[
-            :MAX_FUZZY_CANDIDATES * 20
-        ]
+        candidate_labels = sorted(
+            candidate_set,
+            key=lambda label: (
+                -len(query_tokens & self.vocab.label_tokens.get(label, set())),
+                -similarity(normalized, label),
+                label,
+            ),
+        )[:MAX_FUZZY_CANDIDATES * 20]
 
         for label in candidate_labels:
 
@@ -633,10 +633,13 @@ class SkillMapper:
                     []
                 )
 
-                if uris:
+                if uris and (
+                    score > fuzzy_best_score
+                    or (score == fuzzy_best_score and (fuzzy_best_uri is None or sorted(uris)[0] < fuzzy_best_uri))
+                ):
 
                     fuzzy_best_score = score
-                    fuzzy_best_uri = uris[0]
+                    fuzzy_best_uri = sorted(uris)[0]
 
         if (
             fuzzy_best_uri

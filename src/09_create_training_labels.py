@@ -28,6 +28,7 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 
 import matching_core as mc
+import candidate_retrieval
 
 warnings.filterwarnings("ignore")
 
@@ -387,12 +388,16 @@ def main():
 
     section("Encoding ACTUAL resume text")
 
-    resume_embeddings = model.encode(
+    resume_embeddings = candidate_retrieval.encode_texts_cached(
         resume_texts,
+        encode=lambda batch: model.encode(
+            batch, batch_size=BATCH_SIZE, show_progress_bar=False,
+            convert_to_numpy=True, normalize_embeddings=True,
+        ),
+        model_name=MODEL_NAME,
+        cache_dir=PROJECT_ROOT / "data" / "cache",
         batch_size=BATCH_SIZE,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True
+        progress=lambda fraction: print(f"  Resume embedding cache: {fraction:.0%}"),
     )
 
     print(
@@ -406,12 +411,16 @@ def main():
 
     section("Encoding ACTUAL job title + description")
 
-    job_embeddings = model.encode(
+    job_embeddings = candidate_retrieval.encode_texts_cached(
         job_texts,
+        encode=lambda batch: model.encode(
+            batch, batch_size=BATCH_SIZE, show_progress_bar=False,
+            convert_to_numpy=True, normalize_embeddings=True,
+        ),
+        model_name=MODEL_NAME,
+        cache_dir=PROJECT_ROOT / "data" / "cache",
         batch_size=BATCH_SIZE,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True
+        progress=lambda fraction: print(f"  Job embedding cache: {fraction:.0%}"),
     )
 
     print(

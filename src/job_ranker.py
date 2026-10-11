@@ -46,11 +46,12 @@ import numpy as np
 import pandas as pd
 
 import matching_core as mc
+import candidate_retrieval
 from esco_vocab import ESCOVocabulary
 
 logger = logging.getLogger(__name__)
 
-CACHE_SCHEMA = 1
+CACHE_SCHEMA = 2
 
 EMBEDDINGS_FILE = "job_embeddings.npy"
 EMBEDDINGS_META_FILE = "job_embeddings.meta.json"
@@ -275,6 +276,15 @@ def _text_fingerprint(texts: Sequence[str]) -> str:
     return digest.hexdigest()
 
 
+def _skill_cells_fingerprint(values: Optional[Sequence[Any]]) -> str:
+    """Deterministic fingerprint of dataset-provided skill cells."""
+    if values is None:
+        return "no-skill-column"
+    canonical = [sorted(set(parse_skill_list(value))) for value in values]
+    payload = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8", "ignore")).hexdigest()
+
+
 # ---- embeddings -------------------------------------------------------------
 
 def load_or_build_embeddings(
@@ -369,6 +379,7 @@ def build_job_skill_sets(
         "schema": CACHE_SCHEMA,
         "vocabulary": vocabulary.fingerprint,
         "text_sha1": text_digest,
+        "skill_cells_sha256": _skill_cells_fingerprint(dataset_skill_cells),
         "rows": len(texts),
         "uses_skill_column": dataset_skill_cells is not None,
     }
@@ -508,12 +519,17 @@ def build_job_corpus(
     if progress:
         progress("Indexing job text...", 1.0)
 
-    corpus_fingerprint = hashlib.sha1(
+    skill_cells_digest = _skill_cells_fingerprint(
+        jobs[columns["skills"]].tolist() if columns["skills"] else None
+    )
+    corpus_fingerprint = hashlib.sha256(
         "|".join(
             [
                 digest,
+                skill_cells_digest,
                 model_name,
                 vocabulary.fingerprint if vocabulary else "no-vocabulary",
+                str(CACHE_SCHEMA),
             ]
         ).encode()
     ).hexdigest()
@@ -560,27 +576,22 @@ def rank_jobs(
     resume_embedding: np.ndarray,
     resume_skills: Iterable[str],
     scorer: mc.MatchScorer,
+    max_candidates_per_signal: int = candidate_retrieval.DEFAULT_CANDIDATES_PER_SIGNAL,
 ) -> pd.DataFrame:
-    """
-    Score and rank every job for one resume.
+    """Retrieve a shared candidate union, then score/rank those job rows.
 
-    ``resume_skills`` are ESCO skill URIs (see ``resume_skill_uris``).
-    Returns one row per job, best first, with ``row_index`` pointing at
-    ``corpus.frame``, the features, ``hybrid_match_score`` and
-    ``scoring_method``.
+    Offline Step 7 uses the same semantic + lexical + skill union policy.
+    Signals are computed against the entire corpus, but model/formula scores
+    are only evaluated for candidate rows. ``row_index`` always points back
+    to ``corpus.frame``.
     """
-
     skills = set(resume_skills)
-
     vector = np.asarray(resume_embedding, dtype=np.float32).reshape(-1)
-
     norm = float(np.linalg.norm(vector))
-
     if norm > 0:
         vector = vector / norm
 
     embeddings = corpus.embeddings
-
     if embeddings.shape[1] != vector.shape[0]:
         raise ValueError(
             f"Resume embedding has {vector.shape[0]} dimensions but the job "
@@ -589,9 +600,7 @@ def rank_jobs(
         )
 
     cosine = embeddings @ vector
-
     resume_tokens = mc.token_set(resume_text)
-
     features = mc.build_feature_frame(
         semantic_cosine=cosine,
         title_sim=corpus.title_index.fraction_present(resume_tokens),
@@ -601,34 +610,49 @@ def rank_jobs(
         job_count=corpus.skill_index.sizes,
     )
 
-    result = scorer.score(features)
-
-    ranked = features.copy()
-
-    ranked.insert(0, "row_index", np.arange(len(features)))
-
-    id_column = corpus.columns["id"]
-
-    ranked.insert(
-        1,
-        "job_id",
-        corpus.frame[id_column].to_numpy()
-        if id_column
-        else np.arange(len(features)),
+    selection = candidate_retrieval.select_candidate_indices(
+        resume_text=resume_text,
+        job_texts=corpus.texts,
+        resume_skills=skills,
+        job_skill_sets=corpus.skill_sets,
+        semantic_cosine=cosine,
+        lexical_scores=features["text_containment"].to_numpy(),
+        shared_skill_counts=features["shared_skill_count"].to_numpy(),
+        skill_jaccard_scores=features["jaccard_similarity"].to_numpy(),
+        max_candidates_per_signal=max_candidates_per_signal,
     )
+    candidate_indices = np.asarray(selection.indices, dtype=np.int64)
+    candidate_features = features.iloc[candidate_indices].copy()
+    if candidate_features.empty:
+        return pd.DataFrame(columns=[
+            "row_index", "job_id", "job_title", *mc.MODEL_FEATURES,
+            "hybrid_match_score", "scoring_method", "claim_label",
+            "candidate_retrieval_sources", "candidate_semantic_cosine",
+            "candidate_lexical_overlap", "formula_match_score", "recommendation_rank",
+        ])
+    result = scorer.score(candidate_features)
 
-    ranked.insert(2, "job_title", corpus.titles)
-
+    ranked = candidate_features.copy()
+    ranked.insert(0, "row_index", candidate_indices)
+    id_column = corpus.columns["id"]
+    ranked.insert(1, "job_id", (
+        corpus.frame.iloc[candidate_indices][id_column].to_numpy()
+        if id_column else candidate_indices
+    ))
+    ranked.insert(2, "job_title", [corpus.titles[i] for i in candidate_indices])
     ranked["hybrid_match_score"] = result.scores
     ranked["scoring_method"] = result.method
+    ranked["claim_label"] = getattr(
+        scorer, "claim_label", "experimental_similarity_not_validated"
+    )
+    ranked["scorer_fingerprint"] = getattr(scorer, "scorer_fingerprint", "")
+    ranked["candidate_retrieval_sources"] = [
+        ",".join(selection.sources[int(i)]) for i in candidate_indices
+    ]
+    ranked["candidate_semantic_cosine"] = selection.semantic_cosine[candidate_indices]
+    ranked["candidate_lexical_overlap"] = selection.lexical_scores[candidate_indices]
+    ranked["formula_match_score"] = mc.formula_score(candidate_features)
 
-    # The transparent formula is always available. It is shown next to a
-    # trained model's score and breaks ties: a model trained on a 0/1
-    # proxy can saturate, giving many jobs the identical top score.
-    ranked["formula_match_score"] = mc.formula_score(features)
-
-    # Deterministic: score, formula score, the individual signals, then
-    # row order.
     ranked = ranked.sort_values(
         by=[
             "hybrid_match_score",
@@ -641,10 +665,28 @@ def rank_jobs(
         ascending=[False, False, False, False, False, True],
         kind="mergesort",
     ).reset_index(drop=True)
-
     ranked["recommendation_rank"] = np.arange(1, len(ranked) + 1)
-
     return ranked
+
+
+def rank_resume(
+    corpus: JobCorpus,
+    *,
+    resume_text: str,
+    resume_embedding: np.ndarray,
+    resume_skills: Iterable[str],
+    scorer: mc.MatchScorer,
+    max_candidates_per_signal: int = candidate_retrieval.DEFAULT_CANDIDATES_PER_SIGNAL,
+) -> pd.DataFrame:
+    """Canonical public ranking entry point for app and CLI callers."""
+    return rank_jobs(
+        corpus,
+        resume_text=resume_text,
+        resume_embedding=resume_embedding,
+        resume_skills=resume_skills,
+        scorer=scorer,
+        max_candidates_per_signal=max_candidates_per_signal,
+    )
 
 
 def skill_breakdown(

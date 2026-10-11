@@ -661,6 +661,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             holdout_metrics=metrics,
             train_pairs=int(len(labelled)),
             monotonic_constraints=list(mc.MODEL_MONOTONIC_CST),
+            claim_label="experimental_similarity_not_validated",
+            human_validation_status="not_validated",
         )
 
         saved_path = str(args.output)

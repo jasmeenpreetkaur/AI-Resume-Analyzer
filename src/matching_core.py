@@ -43,6 +43,8 @@ Signal conventions (all in [0, 1]):
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -494,6 +496,7 @@ class MatchScorer:
     metadata: Dict[str, Any] = field(default_factory=dict)
     model_path: Optional[str] = None
     fallback_reason: str = ""
+    _scorer_fingerprint_cache: Optional[str] = field(default=None, init=False, repr=False)
 
     # ------------------------------------------------------------------
 
@@ -504,6 +507,63 @@ class MatchScorer:
     @property
     def method(self) -> str:
         return METHOD_MODEL if self.uses_model else METHOD_FORMULA
+
+    @property
+    def scorer_fingerprint(self) -> str:
+        """Fingerprint scoring code, retrieval policy and active model artifact."""
+        if self._scorer_fingerprint_cache is not None:
+            return self._scorer_fingerprint_cache
+        digest = hashlib.sha256()
+        for path in (
+            Path(__file__),
+            PROJECT_ROOT / "src" / "candidate_retrieval.py",
+            PROJECT_ROOT / "src" / "job_ranker.py",
+        ):
+            if path.is_file():
+                digest.update(path.name.encode("utf-8"))
+                digest.update(path.read_bytes())
+        digest.update(json.dumps(WEIGHTS, sort_keys=True).encode("utf-8"))
+        digest.update(self.method.encode("utf-8"))
+        model_path = Path(self.model_path) if self.uses_model and self.model_path else None
+        if model_path and model_path.is_file():
+            digest.update(hashlib.sha256(model_path.read_bytes()).digest())
+        else:
+            digest.update(b"weighted-formula")
+        self._scorer_fingerprint_cache = digest.hexdigest()
+        return self._scorer_fingerprint_cache
+
+    @property
+    def claim_label(self) -> str:
+        """Use suitability wording only when a matching human-review gate passed."""
+        report_path = Path(
+            os.getenv("MATCH_VALIDATION_REPORT_PATH")
+            or (PROJECT_ROOT / "reports" / "human_judgment_evaluation.json")
+        )
+        if report_path.is_file():
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                if (
+                    report.get("suitability_wording_allowed") is True
+                    and report.get("scorer_fingerprint") == self.scorer_fingerprint
+                    and report.get("human_validation_status") == "approved"
+                ):
+                    return "human_validated_relevance"
+            except (OSError, ValueError, TypeError):
+                pass
+        return "experimental_similarity_not_validated"
+
+    @property
+    def suitability_wording_allowed(self) -> bool:
+        return self.claim_label == "human_validated_relevance"
+
+    @property
+    def claim_description(self) -> str:
+        if self.suitability_wording_allowed:
+            return "Human-judgment validation gate passed for this scorer version."
+        return (
+            "Experimental similarity only; relevance has not been validated "
+            "against sufficient independent human judgments."
+        )
 
     @property
     def description(self) -> str:

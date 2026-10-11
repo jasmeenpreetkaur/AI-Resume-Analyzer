@@ -137,6 +137,25 @@ def test_step4_uses_the_pdf_parser_output(project):
     assert "resumes_parsed.jsonl" in json.dumps(report)
 
 
+def test_step12_checks_step10_scorer_fingerprint(project):
+    # The synthetic fixture ran Steps 2-10, so Step 12 should accept the current
+    # fingerprint and materialize recommendations without retraining anything.
+    must_run(project, "12_final_recommendation_pipeline.py")
+
+    report_path = project / "reports" / "final_recommendation_report.json"
+    report = json.loads(report_path.read_text())
+    assert report["validation"]["scorer_fingerprint_matches_step10"] is True
+    assert report["score_presentation"]["display_name"] == "Similarity Score"
+
+    predictions_path = project / "data" / "evaluation" / "step10_matching_predictions.csv"
+    predictions = pd.read_csv(predictions_path)
+    predictions.loc[0, "scorer_fingerprint"] = "stale-fingerprint"
+    predictions.to_csv(predictions_path, index=False)
+    done = run_script(project, "12_final_recommendation_pipeline.py")
+    assert done.returncode != 0
+    assert "fingerprint" in (done.stdout + done.stderr).lower()
+
+
 # ----------------------------------------------------------------------
 # 4. Scanned resumes
 # ----------------------------------------------------------------------
@@ -205,6 +224,18 @@ def test_only_skills_become_skills(project):
     assert report["vocabulary"]["non_skill_rows_ignored"] == 2
     assert report["method"]["skills_table_only"] is True
     assert report["method"]["uses_hidden_labels"] is False
+
+
+def test_step7_union_keeps_candidates_without_shared_skills(project):
+    matching = processed(project, "resume_job_matching.csv")
+    assert "candidate_retrieval_sources" in matching.columns
+    assert matching["candidate_retrieval_sources"].fillna("").str.len().gt(0).all()
+    assert (matching["shared_skill_count"] == 0).any()
+
+    report = json.loads((project / "reports" / "matching_dataset_report.json").read_text())
+    assert report["matching_statistics"]["candidate_policy"] == (
+        "semantic_top_k_union_lexical_top_k_union_esco_skill_top_k"
+    )
 
 
 # ----------------------------------------------------------------------

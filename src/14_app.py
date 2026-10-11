@@ -888,8 +888,12 @@ def deterministic_explanation(
     matched_skills: list[str],
     skill_gaps: list[str],
     evidence_level: str = "good",
-    job_skill_count: int = 0
+    job_skill_count: int = 0,
+    claim_label: str = "experimental_similarity_not_validated",
 ):
+    validated = claim_label == "human_validated_relevance"
+    result_phrase = "match" if validated else "similarity result"
+    section_title = "Why this role matches" if validated else "Why this result appears similar"
 
     matched_text = ", ".join(
         matched_skills[:6]
@@ -909,15 +913,14 @@ def deterministic_explanation(
     else:
 
         why = (
-            f"The semantic content of your resume has "
-            f"some alignment with the {job_title} role, "
-            f"although few direct skill overlaps were detected."
+            f"The text in your resume has some semantic overlap with the "
+            f"{job_title} posting, although few direct skill overlaps were detected."
         )
 
     if evidence_level == "insufficient":
         why += (
             " The posting gave too little specific skill information, "
-            "so this match mostly reflects text similarity."
+            f"so this {result_phrase} mostly reflects text similarity."
         )
     elif evidence_level == "limited":
         why += (
@@ -969,7 +972,7 @@ def deterministic_explanation(
         )
 
     return (
-        f"**Why this role matches**\n"
+        f"**{section_title}**\n"
         f"{why}\n\n"
         f"**Skills you already have**\n"
         f"{skills}\n\n"
@@ -985,8 +988,12 @@ def generate_user_friendly_explanation(
     matched_skills: list[str],
     skill_gaps: list[str],
     evidence_level: str = "good",
-    job_skill_count: int = 0
+    job_skill_count: int = 0,
+    claim_label: str = "experimental_similarity_not_validated",
 ):
+    validated = claim_label == "human_validated_relevance"
+    role_header = "Why this role matches" if validated else "Why this result appears similar"
+    result_phrase = "match" if validated else "similarity result"
 
     if client is None:
         return deterministic_explanation(
@@ -994,7 +1001,8 @@ def generate_user_friendly_explanation(
             matched_skills,
             skill_gaps,
             evidence_level,
-            job_skill_count
+            job_skill_count,
+            claim_label,
         )
 
     matched_text = ", ".join(
@@ -1031,21 +1039,24 @@ Skills found in both resume and job:
 Skills mentioned in the job posting but not detected in the resume:
 {gaps_text}
 
+Claim label: {claim_label}
+
 Rules:
 - Mention ONLY skills that are listed above. Do not infer or invent other skills or abilities.
+- {("You may describe the result as human-judgment-validated relevance, but never as hiring probability." if validated else "Describe this only as experimental text similarity. Do not call the role a match, suitable, or a suitability recommendation.")}
 - Do not write placeholders or parenthetical notes about "other" skills.
 - The resume evidence is keyword detection only. Do not describe proficiency or
   seniority (avoid words like strong, proven, extensive, expert, demonstrates).
 - Do not describe what this kind of role typically requires; refer only to the
   skills listed above. The posting does not say whether a skill is required or optional.
 - If the skill evidence quality is "limited" or "insufficient", say plainly that the posting
-  gave little skill information and the match mostly reflects text similarity.
+  gave little skill information and the {result_phrase} mostly reflects text similarity.
   Never say there are no skill gaps in that case.
 
 Write exactly three short sections:
 
-Why this role matches:
-Explain the strongest evidence.
+{role_header}:
+Explain the strongest evidence without overstating it.
 
 Skills you already have:
 Mention the most relevant matching skills.
@@ -1064,8 +1075,11 @@ Keep the explanation concise and useful to the user.
                 {
                     "role": "system",
                     "content": (
-                        "You explain resume-job matches. "
-                        "Always respond in normal human-readable English."
+                        (
+                            "You explain evidence from resume and job text. "
+                            if not validated else "You explain human-judgment-validated resume-job relevance. "
+                        )
+                        + "Always respond in normal human-readable English."
                     )
                 },
                 {
@@ -1090,7 +1104,8 @@ Keep the explanation concise and useful to the user.
                 matched_skills,
                 skill_gaps,
                 evidence_level,
-                job_skill_count
+                job_skill_count,
+                claim_label,
             )
             + "\n\n"
               "*LLM explanation unavailable; evidence-based "
@@ -1102,7 +1117,8 @@ Keep the explanation concise and useful to the user.
         matched_skills,
         skill_gaps,
         evidence_level,
-        job_skill_count
+        job_skill_count,
+        claim_label,
     )
 
 
@@ -1277,7 +1293,7 @@ def analyze_resume(
         "📈 Scoring and ranking jobs..."
     )
 
-    ranked = job_ranker.rank_jobs(
+    ranked = job_ranker.rank_resume(
         corpus,
         resume_text=resume_text,
         resume_embedding=resume_embedding,
@@ -1437,7 +1453,8 @@ def analyze_resume(
                 row["matched_skills"],
                 row["skill_gaps"],
                 row["evidence_level"],
-                int(row["specific_skill_count"])
+                int(row["specific_skill_count"]),
+                scorer.claim_label,
             )
         )
 
@@ -1464,6 +1481,11 @@ def analyze_resume(
         "skill_matching_enabled": vocabulary is not None,
         "scoring_method": scorer.method,
         "scoring_description": scorer.description,
+        "claim_label": scorer.claim_label,
+        "claim_description": scorer.claim_description,
+        "suitability_wording_allowed": scorer.suitability_wording_allowed,
+        "scorer_fingerprint": scorer.scorer_fingerprint,
+        "candidate_policy": "semantic_top_k_union_lexical_top_k_union_esco_skill_top_k",
         "all_recommendations": ranked,
         "top_recommendations": top,
         "total_jobs": len(corpus),
@@ -1507,11 +1529,14 @@ def display_results(
 
     st.caption(
         "Scoring: "
-        + result.get(
-            "scoring_description",
-            "unknown"
-        )
+        + result.get("scoring_description", "unknown")
     )
+
+    if not result.get("suitability_wording_allowed", False):
+        st.warning(
+            "Experimental similarity scores — not validated against sufficient human relevance judgments. "
+            "These scores are not hiring probabilities and should not be interpreted as proof that a role is suitable."
+        )
 
     if result.get("extraction", {}).get("ocr_used"):
 
@@ -1554,7 +1579,7 @@ def display_results(
 
     with c4:
         st.metric(
-            "Top Match",
+            "Top Suitability" if result.get("suitability_wording_allowed", False) else "Top Similarity",
             score_percent(
                 top.iloc[0][
                     "hybrid_match_score"
@@ -1566,8 +1591,8 @@ def display_results(
 
     if len(top) == 0:
         st.warning(
-            "No postings met your preferences and minimum overall match. "
-            "Try lowering the minimum match or broadening your career interests."
+            "No postings met the current filters and score threshold. "
+            "Try lowering the threshold or broadening your career interests."
         )
         return
 
@@ -1614,7 +1639,8 @@ def display_results(
 
         with st.expander(
             f"#{rank}  {row['job_title']}   "
-            f"• Match {score_percent(row['hybrid_match_score'])}",
+            f"• {'Suitability' if result.get('suitability_wording_allowed', False) else 'Similarity'} "
+            f"{score_percent(row['hybrid_match_score'])}",
             expanded=(rank == 1)
         ):
 
@@ -1623,7 +1649,7 @@ def display_results(
             with c1:
 
                 st.metric(
-                    "Overall Match",
+                    "Overall Suitability" if result.get("suitability_wording_allowed", False) else "Overall Similarity",
                     score_percent(
                         row[
                             "hybrid_match_score"
@@ -1634,7 +1660,7 @@ def display_results(
             with c2:
 
                 st.metric(
-                    "Semantic Match",
+                    "Semantic Similarity",
                     score_percent(
                         row[
                             "semantic_similarity"
@@ -1722,6 +1748,8 @@ def display_results(
 
             st.markdown(
                 "### 💡 Why This Job Matches"
+                if row.get("claim_label") == "human_validated_relevance"
+                else "### 💡 Why This Result Appears Similar"
             )
 
             # LLM text is rendered as Markdown, never as raw HTML.
@@ -2099,8 +2127,13 @@ def main():
         )
 
     with pref_col3:
+        active_scorer = load_scorer(scorer_signature())
+        threshold_label = (
+            "Minimum suitability score (%)" if active_scorer.suitability_wording_allowed
+            else "Minimum similarity score (%)"
+        )
         min_match_percent = st.slider(
-            "Minimum overall match (%)",
+            threshold_label,
             min_value=0,
             max_value=80,
             value=int(DEFAULT_MIN_MATCH * 100),

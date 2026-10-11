@@ -78,6 +78,7 @@ from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 
 import matching_core as mc
+import candidate_retrieval
 import pdf_text
 from esco_vocab import load_esco_vocabulary
 from job_ranker import (
@@ -1504,9 +1505,12 @@ analysis = {
 
         "claim_label": scorer.claim_label,
         "claim_description": scorer.claim_description,
+        "claim": scorer.claim.to_dict(),
         "suitability_wording_allowed": scorer.suitability_wording_allowed,
         "scorer_fingerprint": scorer.scorer_fingerprint,
         "candidate_policy": "semantic_top_k_union_lexical_top_k_union_esco_skill_top_k",
+        "candidate_policy_fingerprint": candidate_retrieval.DEFAULT_POLICY.fingerprint,
+        "candidates_scored": int(len(recommendations)),
 
         "trained_model_in_use":
             bool(scorer.uses_model),
@@ -1665,9 +1669,11 @@ report = {
 
         "claim_label": scorer.claim_label,
         "claim_description": scorer.claim_description,
+        "claim": scorer.claim.to_dict(),
         "suitability_wording_allowed": scorer.suitability_wording_allowed,
         "scorer_fingerprint": scorer.scorer_fingerprint,
         "candidate_policy": "semantic_top_k_union_lexical_top_k_union_esco_skill_top_k",
+        "candidate_policy_fingerprint": candidate_retrieval.DEFAULT_POLICY.fingerprint,
 
         "trained_model_in_use":
             bool(scorer.uses_model),

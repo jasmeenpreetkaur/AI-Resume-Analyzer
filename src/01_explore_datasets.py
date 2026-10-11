@@ -13,6 +13,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Tuple
 import json
+import sys
 from datetime import datetime
 
 
@@ -376,6 +377,15 @@ def find_data_root() -> Path:
 
 def main():
     """Main execution function."""
+    # Some Windows consoles default to cp1252, which cannot render all the
+    # symbols used in the human-readable report. Replace unsupported glyphs
+    # in console output while preserving their values in the JSON report.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
     try:
         # Find data root automatically
         data_root = find_data_root()

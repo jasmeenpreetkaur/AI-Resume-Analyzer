@@ -32,3 +32,5 @@ pillow>=10.0
 
 # Tests
 pytest>=8.0
+
+scipy>=1.10                # Spearman in Step 11b pooled human-relevance evaluation

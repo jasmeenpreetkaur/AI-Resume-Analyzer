@@ -66,6 +66,9 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "match_regressor.joblib"
+# Output from the pooled human-relevance study (Step 11b). It is separate
+# from the stricter top-10 review report and requires an explicit sign-off.
+HUMAN_REPORT_PATH = PROJECT_ROOT / "reports" / "human_relevance_report.json"
 
 SCHEMA_VERSION = 1
 
@@ -484,6 +487,122 @@ class ScoreResult:
     model_path: Optional[str] = None
 
 
+# ======================================================================
+# HUMAN-RELEVANCE CLAIMS (pooled review workflow)
+# ======================================================================
+
+CLAIM_MODEL_PROXY = "model_category_proxy_unvalidated"
+CLAIM_MODEL_VALIDATED = "model_human_validated"
+CLAIM_FORMULA = "formula_unvalidated"
+CLAIM_FORMULA_VALIDATED = "formula_human_validated"
+
+
+@dataclass
+class ModelClaim:
+    level: str
+    validated: bool
+    label: str
+    statement: str
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "level": self.level,
+            "validated_against_human_judgments": self.validated,
+            "label": self.label,
+            "statement": self.statement,
+            "evidence": self.evidence,
+        }
+
+
+def load_human_report(path: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+    """Load the pooled relevance report, returning None if missing/invalid."""
+    report_path = Path(path or os.getenv("HUMAN_REPORT_PATH") or HUMAN_REPORT_PATH)
+    if not report_path.is_file():
+        return None
+    try:
+        return json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("Ignoring unreadable human-relevance report %s: %s", report_path, exc)
+        return None
+
+
+def resolve_claim(
+    uses_model: bool,
+    metadata: Optional[Dict[str, Any]] = None,
+    report: Optional[Dict[str, Any]] = None,
+    scorer_fingerprint: Optional[str] = None,
+) -> ModelClaim:
+    """
+    Resolve what an evaluated pooled study supports. Evidence alone is not
+    sufficient: the report must match the active scorer fingerprint and the
+    operator must explicitly approve wording after reviewing the metrics.
+    A trained model report must also refer to the same trained model artifact.
+    """
+    metadata = metadata or {}
+    if report is None:
+        report = load_human_report()
+
+    status = (report or {}).get("status")
+    claims = (report or {}).get("claims", {}) if status == "evaluated" else {}
+    report_fp = (report or {}).get("scorer_fingerprint")
+    fingerprint_ok = bool(scorer_fingerprint) and report_fp == scorer_fingerprint
+    approved = (report or {}).get("suitability_wording_approved") is True
+    model_matches = (
+        not uses_model
+        or (report is not None
+            and report.get("model_trained_at") is not None
+            and report.get("model_trained_at") == metadata.get("trained_at"))
+    )
+    evidence = {
+        "status": status,
+        "judged_pairs": (report or {}).get("judged_pairs"),
+        "judged_resumes": (report or {}).get("judged_resumes"),
+        "scorer_fingerprint_matches": fingerprint_ok,
+        "explicit_operator_approval": approved,
+        "model_artifact_matches": model_matches,
+    }
+    gates = fingerprint_ok and approved and model_matches and status == "evaluated"
+
+    if uses_model:
+        supported = bool(gates and claims.get("model_ranks_by_human_relevance"))
+        if supported:
+            return ModelClaim(
+                CLAIM_MODEL_VALIDATED, True,
+                "Trained model (checked against human judgments)",
+                "The ranking passed the pooled human-relevance evaluation for this exact scorer version. It remains a relevance ranking, not a hiring probability.",
+                evidence,
+            )
+        reason = (
+            "the report is for a different scorer version" if report and not fingerprint_ok
+            else "the report was generated for a different model file" if report and not model_matches
+            else "explicit operator approval is missing" if report and not approved
+            else "the study does not show agreement with human judgments" if report and status == "evaluated"
+            else "the human-relevance study has not been run or lacks sufficient data"
+        )
+        return ModelClaim(
+            CLAIM_MODEL_PROXY, False,
+            "Experimental trained model (category proxy, not validated)",
+            "This model was trained on a same-category proxy rather than hiring outcomes. " + reason + ". Treat the score as a similarity ranking, not a measure of suitability, whether you will be hired, or hiring probability.",
+            evidence,
+        )
+
+    supported = bool(gates and claims.get("formula_ranks_by_human_relevance"))
+    if supported:
+        return ModelClaim(
+            CLAIM_FORMULA_VALIDATED, True,
+            "Transparent weighted formula (checked against human judgments)",
+            "The weighted ranking passed the pooled human-relevance evaluation for this exact scorer version. It remains a relevance ranking, not a hiring probability.",
+            evidence,
+        )
+    return ModelClaim(
+        CLAIM_FORMULA, False,
+        "Transparent weighted formula (not validated)",
+        "This score uses a hand-weighted combination of text, skills and title signals. Human relevance is not validated for the active scorer; treat it as similarity, not as a measure of suitability or hiring probability.",
+        evidence,
+    )
+
+
 @dataclass
 class MatchScorer:
     """
@@ -507,6 +626,15 @@ class MatchScorer:
     @property
     def method(self) -> str:
         return METHOD_MODEL if self.uses_model else METHOD_FORMULA
+
+    @property
+    def claim(self) -> ModelClaim:
+        """Claim supported by the pooled human-relevance study, if approved."""
+        return resolve_claim(
+            self.uses_model,
+            self.metadata,
+            scorer_fingerprint=self.scorer_fingerprint,
+        )
 
     @property
     def scorer_fingerprint(self) -> str:
@@ -550,6 +678,10 @@ class MatchScorer:
                     return "human_validated_relevance"
             except (OSError, ValueError, TypeError):
                 pass
+        # The pooled study is a second valid path only after its own metrics,
+        # exact fingerprint, matching model artifact and explicit sign-off pass.
+        if self.claim.validated:
+            return "human_validated_relevance"
         return "experimental_similarity_not_validated"
 
     @property
@@ -572,9 +704,14 @@ class MatchScorer:
 
             target = self.metadata.get("target", "unknown target")
 
+            validation_note = (
+                "human-relevance validated" if self.claim.validated
+                else "NOT validated against human judgments"
+            )
             return (
                 f"Trained {type(self.estimator).__name__} "
-                f"({Path(self.model_path or '').name}; target: {target})"
+                f"({Path(self.model_path or '').name}; target: {target}; "
+                f"{validation_note})"
             )
 
         reason = f" - {self.fallback_reason}" if self.fallback_reason else ""

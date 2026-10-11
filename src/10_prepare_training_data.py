@@ -1092,8 +1092,12 @@ report = {
 
         "claim_label": scorer.claim_label,
         "claim_description": scorer.claim_description,
+        "claim": scorer.claim.to_dict(),
         "suitability_wording_allowed": scorer.suitability_wording_allowed,
         "scorer_fingerprint": scorer.scorer_fingerprint,
+        "model_trained_at": (
+            scorer.metadata.get("trained_at") if scorer.uses_model else None
+        ),
 
         "trained_model_in_use":
             bool(scorer.uses_model),

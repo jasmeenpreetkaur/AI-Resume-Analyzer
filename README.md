@@ -21,20 +21,23 @@ From the project root:
 ```bash
 python -m pip install -r requirements.txt
 python src/run_pipeline.py --dry-run
-python src/run_pipeline.py
+python src/run_pipeline.py --model auto
 ```
 
-Optional proxy-model training runs Step 10b before Step 10:
+`--model auto` reuses an existing model if one is installed. Choose explicitly when changing that behavior: `--model train` runs Step 10b; `--model omit` moves an existing model aside (rather than deleting it) and uses the formula scorer. Step 11's automatic diagnostics run after Step 10 in all cases. The older `--with-model` flag remains as an alias for `--model train`. The legacy `--with-final-recommendations` option is accepted for compatibility; Step 12 runs during every full pipeline execution.
 
 ```bash
-python src/run_pipeline.py --with-model
+python src/run_pipeline.py --model train
+python src/run_pipeline.py --model omit
 ```
 
-The model target is a same-category proxy, not a human hiring label. `--force-model` explicitly bypasses Step 10b's model-quality gate and should only be used deliberately. To also run the final recommendation materialization step:
+The model target is a same-category proxy, not a human hiring label. `--force-model` explicitly bypasses Step 10b's model-quality gate and should only be used deliberately. To require successful model installation, add `--require-model`; to also run the final recommendation materialization step:
 
 ```bash
-python src/run_pipeline.py --with-final-recommendations
+python src/run_pipeline.py --model auto --with-final-recommendations --verify-deployment
 ```
+
+`--verify-deployment` explicitly requests the parity check after Step 12 (verification also runs by default unless `--skip-verify` is supplied). The runner records each command, exit code, duration, model decision, active scorer fingerprint, and claim metadata in `reports/pipeline_run_report.json`.
 
 ## Human relevance review
 
@@ -58,6 +61,21 @@ python src/11b_evaluate_human_judgments.py --evaluate data/evaluation/human_judg
 
 Approval is tied to the active scorer fingerprint. Changes to scoring or retrieval code, or to the loaded model, require a fresh Step 10 run and new judgments.
 
+### Optional deeper pooled-relevance study
+
+The added `src/11b_human_relevance_judgments.py` workflow evaluates the ranking formula, trained model, semantic-only, skill-only, and category-proxy baselines over a pooled candidate sample. It reports per-resume Spearman correlation, nDCG/precision, reviewer agreement, bootstrap comparisons, and whether the same-category training proxy tracks human relevance.
+
+```bash
+# Export a shuffled sample of candidate pairs from the Step 9 dataset
+python src/11b_human_relevance_judgments.py export --resumes 40
+# Fill relevance (0=not relevant through 3=strong fit) and annotator in the CSV
+python src/11b_human_relevance_judgments.py evaluate --judgments data/evaluation/human_judgments_template.csv
+# Only after reviewing the metrics, explicitly request the suitability-wording gate
+python src/11b_human_relevance_judgments.py evaluate --judgments data/evaluation/human_judgments_template.csv --approve-suitability-wording
+```
+
+This is a complementary evaluation to the top-10-focused review workflow above. Statistical support alone does not unlock the app's suitability wording: the evaluation must be sufficient, the scorer fingerprint must match, and the explicit approval flag must be supplied.
+
 ## Verify
 
 ```bash
@@ -69,9 +87,14 @@ python src/verify_pipeline.py --mode tests
 
 # Check live input files and output schemas after a real-data run
 python src/verify_pipeline.py --mode deployment
+
+# Verify the active model/scorer against Step 10 and Step 12 artifacts
+python src/verify_deployment.py --mode artifacts
+# Or run materialization and the deployment verifier from the pipeline runner
+python src/run_pipeline.py --with-final-recommendations --verify-deployment
 ```
 
-The deployment verifier checks file presence, schema, and current scorer metadata. It does not establish recommendation quality, fairness, or hiring validity. Those require human judgment and suitable evaluation data.
+The verifiers check source integrity, file/schema presence, and current scorer fingerprints across pipeline outputs. The deployment verifier is adapted to the current app/ranker interfaces. Neither verifier establishes recommendation quality, fairness, or hiring validity; those require human judgment and suitable evaluation data. The on-disk `EmbeddingStore` caches normalized text vectors by model and text so Step 7 and Step 9 can reuse encodings rather than repeatedly encoding the same strings.
 
 ## Configuration and secrets
 

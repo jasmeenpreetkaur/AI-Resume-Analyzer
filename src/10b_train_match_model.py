@@ -663,6 +663,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             monotonic_constraints=list(mc.MODEL_MONOTONIC_CST),
             claim_label="experimental_similarity_not_validated",
             human_validation_status="not_validated",
+            target_is_proxy=True,
+            human_validated=False,
         )
 
         saved_path = str(args.output)
@@ -682,6 +684,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "status": "completed",
             "model_saved": saved_path is not None,
             "model_path": saved_path,
+            "target_is_proxy": True,
+            "human_validated": False,
             "saved_because": (
                 reason if qualifies
                 else ("forced" if args.force else None)
@@ -714,6 +718,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             ),
         }
     )
+
+    active_scorer = mc.MatchScorer.load()
+    report["claim"] = active_scorer.claim.to_dict()
+    report["scoring"] = {
+        "scoring_method": active_scorer.method,
+        "model_trained_at": active_scorer.metadata.get("trained_at") if active_scorer.uses_model else None,
+        "scorer_fingerprint": active_scorer.scorer_fingerprint,
+        "claim": active_scorer.claim.to_dict(),
+    }
 
     write_report(report, args.report)
 

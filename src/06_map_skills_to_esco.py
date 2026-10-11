@@ -36,6 +36,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import math
 import re
 import unicodedata
 from collections import defaultdict
@@ -279,6 +280,50 @@ class ESCOVocabulary:
 
         self.unique_labels: list[str] = []
 
+        # token -> labels containing it (each list sorted). Built once in
+        # build(); both the token-similarity stage and the fuzzy stage
+        # draw their candidates from it instead of scanning every label.
+        self.token_index: dict[str, list[str]] = {}
+
+    def candidate_labels(
+        self,
+        query_tokens: set[str],
+    ) -> list[str]:
+        """
+        Every label that shares at least one token with the query,
+        best candidates first.
+
+        Ranking is the sum of the inverse document frequency of the
+        shared tokens (so "kubernetes" outweighs "management"), then the
+        label text. It depends only on the vocabulary and the query, never
+        on set/hash iteration order, so the same skill always gets the
+        same candidates - on every run and every Python process.
+        """
+
+        label_count = max(len(self.unique_labels), 1)
+
+        weights: dict[str, float] = {}
+
+        for token in sorted(query_tokens):
+
+            labels = self.token_index.get(token)
+
+            if not labels:
+                continue
+
+            idf = math.log(1.0 + label_count / len(labels))
+
+            for label in labels:
+                weights[label] = weights.get(label, 0.0) + idf
+
+        return [
+            label
+            for label, _ in sorted(
+                weights.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ]
+
     def build(self, df: pd.DataFrame) -> None:
 
         uri_col = find_column(
@@ -386,9 +431,20 @@ class ESCOVocabulary:
                             normalized_alt
                         ] = tokenize(alternative)
 
-        # Stable label order means equal-scoring ties do not depend on CSV
-        # row-order artefacts or set/dict construction details.
-        self.unique_labels = sorted(self.all_labels.keys())
+        self.unique_labels = list(
+            self.all_labels.keys()
+        )
+
+        self.token_index = {}
+
+        for label in sorted(self.all_labels):
+
+            for token in sorted(
+                self.label_tokens.get(label, ())
+            ):
+                self.token_index.setdefault(
+                    token, []
+                ).append(label)
 
         logger.info(
             f"Unique ESCO skills: {len(self.skills)}"
@@ -409,14 +465,6 @@ class SkillMapper:
     def __init__(self, vocabulary: ESCOVocabulary):
 
         self.vocab = vocabulary
-
-        # Deterministic inverted token index for fuzzy candidates. A set's
-        # iteration order depends on PYTHONHASHSEED; using next(iter(tokens))
-        # made some fuzzy mappings vary between runs.
-        self.labels_by_token: dict[str, set[str]] = defaultdict(set)
-        for label in sorted(self.vocab.unique_labels):
-            for token in self.vocab.label_tokens.get(label, set()):
-                self.labels_by_token[token].add(label)
 
         self.stats = {
             "total": 0,
@@ -547,24 +595,18 @@ class SkillMapper:
 
         query_tokens = tokenize(normalized)
 
+        # Labels sharing at least one token, in a deterministic best-first
+        # order (see ESCOVocabulary.candidate_labels). A tie on score goes
+        # to the earlier, better-ranked label.
+        ranked_labels = (
+            self.vocab.candidate_labels(query_tokens)
+            if query_tokens
+            else []
+        )
+
         if query_tokens:
 
-            for label in self.vocab.unique_labels:
-
-                label_tokens = self.vocab.label_tokens.get(
-                    label,
-                    set()
-                )
-
-                if not label_tokens:
-                    continue
-
-                intersection = len(
-                    query_tokens & label_tokens
-                )
-
-                if intersection == 0:
-                    continue
+            for label in ranked_labels:
 
                 score = token_similarity(
                     normalized,
@@ -603,21 +645,14 @@ class SkillMapper:
         fuzzy_best_uri = None
         fuzzy_best_score = 0.0
 
-        # Gather candidates from every query token, then order them by
-        # token overlap, fuzzy similarity and label. This is deterministic
-        # across processes and Python hash seeds.
-        candidate_set: set[str] = set()
-        for token in sorted(query_tokens):
-            candidate_set.update(self.labels_by_token.get(token, set()))
-
-        candidate_labels = sorted(
-            candidate_set,
-            key=lambda label: (
-                -len(query_tokens & self.vocab.label_tokens.get(label, set())),
-                -similarity(normalized, label),
-                label,
-            ),
-        )[:MAX_FUZZY_CANDIDATES * 20]
+        # Candidates come from the token index, best-ranked first, over
+        # ALL of the query's tokens. (This used to pick one arbitrary token
+        # with next(iter(set)) - a different token on different runs, and
+        # often a common word - and keep the first 200 labels containing
+        # it in file order.) If nothing shares a token, nothing is scanned.
+        candidate_labels = ranked_labels[
+            :MAX_FUZZY_CANDIDATES * 20
+        ]
 
         for label in candidate_labels:
 
@@ -633,13 +668,10 @@ class SkillMapper:
                     []
                 )
 
-                if uris and (
-                    score > fuzzy_best_score
-                    or (score == fuzzy_best_score and (fuzzy_best_uri is None or sorted(uris)[0] < fuzzy_best_uri))
-                ):
+                if uris:
 
                     fuzzy_best_score = score
-                    fuzzy_best_uri = sorted(uris)[0]
+                    fuzzy_best_uri = uris[0]
 
         if (
             fuzzy_best_uri
@@ -669,12 +701,57 @@ class SkillMapper:
 # DATASET PROCESSING
 # ======================================================================
 
+def uris_from_extracted_cell(value: Any) -> list[str]:
+    """
+    ESCO URIs from a Step 5 ``esco_extracted_skills`` cell (a JSON list of
+    ``{"concept_uri": ..., ...}`` records). Anything unreadable gives [].
+    """
+
+    if value is None or (not isinstance(value, (list, str)) and pd.isna(value)):
+        return []
+
+    records = value
+
+    if isinstance(value, str):
+
+        try:
+            records = json.loads(value)
+        except ValueError:
+            return []
+
+    uris = []
+
+    if isinstance(records, list):
+
+        for record in records:
+
+            if isinstance(record, dict):
+
+                uri = str(record.get("concept_uri") or "").strip()
+
+                if uri and uri not in uris:
+                    uris.append(uri)
+
+    return uris
+
+
 def process_dataset(
     df: pd.DataFrame,
     skill_column: str,
     mapper: SkillMapper,
-    dataset_name: str
+    dataset_name: str,
+    extracted_column: str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Map each row's listed skills to ESCO.
+
+    ``extracted_column`` (jobs only) names Step 5's text-extracted ESCO
+    skills. Their URIs are ADDED to the mapped ones. Without this a job's
+    skills were only what its structured ``job_skills`` list happened to
+    map to, so "Python Developer" with a skills list that omits Python had
+    no Python skill offline, while the live app (which reads the job's
+    text) did. Both sides now see the text-extracted skills.
+    """
 
     logger.info("")
     logger.info("=" * 70)
@@ -691,6 +768,7 @@ def process_dataset(
 
     total_skills = 0
     mapped_skills = 0
+    uris_added_from_text = 0
 
     for index, value in enumerate(
         output[skill_column],
@@ -723,6 +801,16 @@ def process_dataset(
             for item in row_mappings
             if item["esco_skill_label"]
         ]
+
+        if extracted_column is not None:
+
+            for uri in uris_from_extracted_cell(
+                output[extracted_column].iloc[index - 1]
+            ):
+
+                if uri not in mapped:
+                    mapped.append(uri)
+                    uris_added_from_text += 1
 
         if mapped:
             rows_with_mapped_skills += 1
@@ -776,7 +864,9 @@ def process_dataset(
         "skill_mapping_coverage": round(
             coverage,
             4
-        )
+        ),
+        "text_extracted_column_merged": extracted_column,
+        "uris_added_from_text_extraction": uris_added_from_text,
     }
 
     return output, report
@@ -933,7 +1023,12 @@ def main() -> None:
         jobs,
         job_skill_column,
         mapper,
-        "jobs"
+        "jobs",
+        extracted_column=(
+            "esco_extracted_skills"
+            if "esco_extracted_skills" in jobs.columns
+            else None
+        )
     )
 
     # --------------------------------------------------------------

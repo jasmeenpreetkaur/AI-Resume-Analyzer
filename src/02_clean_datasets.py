@@ -615,10 +615,11 @@ def main():
 
         status = result.get("status", "unknown")
 
-        print(
-            f"  {'✓' if status == 'success' else '✗'} "
-            f"{name}: {status}"
-        )
+        # Use ASCII status markers so the script also works with Windows
+        # consoles using cp1252 instead of UTF-8. Unicode status glyphs can
+        # raise UnicodeEncodeError and abort otherwise successful pipelines.
+        marker = "OK" if status == "success" else "ERROR"
+        print(f"  [{marker}] {name}: {status}")
 
     print(
         f"\nPDF validation: {pdf_status}"

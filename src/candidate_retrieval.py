@@ -7,6 +7,8 @@ The returned set is a candidate-generation result, not a suitability verdict.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -14,6 +16,34 @@ import numpy as np
 import matching_core as mc
 
 DEFAULT_CANDIDATES_PER_SIGNAL = 100
+
+
+@dataclass(frozen=True)
+class CandidatePolicy:
+    """Versioned, inspectable parameters for the shared retrieval union."""
+    max_candidates_per_signal: int = DEFAULT_CANDIDATES_PER_SIGNAL
+    name: str = "semantic_lexical_esco_skill_union"
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "signals": ["semantic", "lexical", "esco_skill"],
+            "max_candidates_per_signal": int(self.max_candidates_per_signal),
+            "candidate_pool_is_full_scan": self.max_candidates_per_signal >= 2_000_000_000,
+        }
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(
+            json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+
+DEFAULT_POLICY = CandidatePolicy()
+FULL_SCAN_POLICY = CandidatePolicy(
+    max_candidates_per_signal=2_147_483_647,
+    name="full_scan_all_jobs",
+)
 
 
 @dataclass(frozen=True)
@@ -173,66 +203,35 @@ def encode_texts_cached(
     batch_size: int = 64,
     progress=None,
 ) -> np.ndarray:
-    """Encode unique texts with per-text content-addressed caching.
+    """Encode unique texts with the shared compact on-disk embedding store.
 
-    Per-text caching makes Step 9 reuse Step 7's vectors even when Step 9's
-    candidate pairs refer to only a subset of resumes/jobs. Cache keys include
-    model name and exact cleaned text, so text/model changes cannot reuse stale
-    embeddings. All returned vectors are L2-normalized.
+    Step 7 and Step 9 call this same helper, so repeated texts and changed row
+    orders reuse vectors. Keys are scoped to the model name and exact cleaned
+    text. The store persists raw vectors; this public function continues to
+    return L2-normalized vectors, preserving the candidate/feature contract.
     """
-    import hashlib
     from pathlib import Path
+    from embedding_store import EmbeddingStore
 
-    root = Path(cache_dir) / "text_embeddings"
-    root.mkdir(parents=True, exist_ok=True)
     cleaned = [mc.clean_text(text) for text in texts]
     if not cleaned:
         return np.zeros((0, 0), dtype=np.float32)
 
-    keys = [
-        hashlib.sha256((str(model_name) + "\0" + text).encode("utf-8", "ignore")).hexdigest()
-        for text in cleaned
-    ]
-    unique_missing: dict[str, str] = {}
-    vectors: dict[str, np.ndarray] = {}
-
-    for key, text in zip(keys, cleaned):
-        path = root / f"{key}.npy"
-        if key in vectors:
-            continue
-        if path.is_file():
-            try:
-                vector = np.asarray(np.load(path, allow_pickle=False), dtype=np.float32).reshape(-1)
-                if vector.size and np.isfinite(vector).all():
-                    vectors[key] = vector
-                    continue
-            except Exception:
-                pass
-        unique_missing[key] = text
-
-    missing_items = list(unique_missing.items())
-    for start in range(0, len(missing_items), max(1, batch_size)):
-        batch = missing_items[start:start + max(1, batch_size)]
-        encoded = np.asarray(encode([text for _, text in batch]), dtype=np.float32)
-        if encoded.ndim != 2 or encoded.shape[0] != len(batch):
-            raise ValueError(
-                f"Encoder returned shape {encoded.shape} for a batch of {len(batch)} texts"
-            )
-        norms = np.linalg.norm(encoded, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        encoded = encoded / norms
-        for (key, _), vector in zip(batch, encoded):
-            vector = np.asarray(vector, dtype=np.float32)
-            path = root / f"{key}.npy"
-            temporary = path.with_suffix(".npy.tmp")
-            with temporary.open("wb") as stream:
-                np.save(stream, vector, allow_pickle=False)
-            temporary.replace(path)
-            vectors[key] = vector
-        if progress:
-            progress(min(1.0, (start + len(batch)) / max(1, len(missing_items))))
-
-    dimensions = {vectors[key].shape[0] for key in keys}
-    if len(dimensions) != 1:
-        raise ValueError(f"Embedding dimension mismatch in cache: {sorted(dimensions)}")
-    return np.vstack([vectors[key] for key in keys]).astype(np.float32, copy=False)
+    store = EmbeddingStore(
+        str(model_name),
+        directory=Path(cache_dir) / "offline",
+    )
+    vectors = np.asarray(
+        store.embed(cleaned, encode, batch_size=batch_size, progress=progress),
+        dtype=np.float32,
+    )
+    if vectors.ndim != 2 or vectors.shape[0] != len(cleaned):
+        raise ValueError(
+            f"Embedding store returned shape {vectors.shape} for {len(cleaned)} texts"
+        )
+    if not np.isfinite(vectors).all():
+        raise ValueError("Embedding store returned non-finite values")
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    vectors = vectors / norms
+    return vectors.astype(np.float32, copy=False)

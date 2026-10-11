@@ -485,8 +485,8 @@ step10_fingerprints = {
 }
 if step10_fingerprints != {current_scorer.scorer_fingerprint}:
     raise RuntimeError(
-        "The active scorer/retrieval code differs from the scorer used by Step 10. "
-        "Rerun src/10_prepare_training_data.py, then rerun Step 12. "
+        "The active scorer/retrieval code or model may have been retrained/replaced "
+        "since Step 10. Rerun src/10_prepare_training_data.py, then rerun Step 12. "
         f"Step 10 fingerprint(s): {sorted(step10_fingerprints)}; "
         f"current fingerprint: {current_scorer.scorer_fingerprint}"
     )
@@ -1097,12 +1097,17 @@ info(
 
 
 # ======================================================================
+# Keep provenance on every persisted recommendation row.
+result["scoring_method"] = current_scorer.method
+top10["scoring_method"] = current_scorer.method
+
 # FINAL OUTPUT COLUMN ORDER
 # ======================================================================
 
 preferred_columns = [
     "resume_id",
     "job_id",
+    "scoring_method",
     "recommendation_rank",
     "is_top_10",
     "match_score",
@@ -1266,6 +1271,15 @@ report = {
         ),
     },
 
+    "scoring": {
+        "scoring_method": current_scorer.method,
+        "description": current_scorer.description,
+        "trained_model_in_use": bool(current_scorer.uses_model),
+        "model_trained_at": current_scorer.metadata.get("trained_at") if current_scorer.uses_model else None,
+        "scorer_fingerprint": current_scorer.scorer_fingerprint,
+        "claim": current_scorer.claim.to_dict(),
+    },
+
     "recommendation_method": {
         "ranking_signal": "Step 10 hybrid_match_score",
         "model_retrained": False,
@@ -1281,6 +1295,7 @@ report = {
         "scorer_fingerprint_matches_step10": True,
         "scorer_fingerprint": current_scorer.scorer_fingerprint,
         "claim_label": current_scorer.claim_label,
+        "claim": current_scorer.claim.to_dict(),
         "suitability_wording_allowed": current_scorer.suitability_wording_allowed,
     },
 

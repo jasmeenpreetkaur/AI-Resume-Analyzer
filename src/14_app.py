@@ -2670,12 +2670,21 @@ def main():
                 "in every field: " + live_status["Adzuna"]["note"] + "."
             )
 
-    interests = st.multiselect(
-        "Which job roles interest you?",
-        options=INTEREST_OPTIONS,
-        default=[],
-        help="Leave empty to consider every role. Matching uses job titles."
-    )
+    # In live mode, the target title above is the single role preference.
+    # Show the category selector only for the offline dataset, where it is
+    # used to filter the finite set of locally available job categories.
+    if source == SOURCE_OFFLINE:
+        interests = st.multiselect(
+            "Which job categories interest you?",
+            options=INTEREST_OPTIONS,
+            default=[],
+            help="Optional filter for the offline dataset. Leave empty to consider every available category."
+        )
+    else:
+        interests = []
+        st.caption(
+            "Your target job title is used for live search. The app also searches roles inferred from your resume, so you only need to enter your target role once."
+        )
 
     pref_col1, pref_col2, pref_col3 = st.columns(3)
 
